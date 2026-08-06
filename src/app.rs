@@ -1,5 +1,6 @@
 use std::{collections::HashSet, path::PathBuf};
 
+use crate::db::models::TablePreview;
 use crate::services;
 use crate::ui;
 use crossbeam_channel::{Receiver, Sender};
@@ -95,6 +96,7 @@ pub struct App {
     pub editor: Option<EditorSession>,
     pub should_quit: bool,
     pub busy_count: usize,
+    pub table_preview: Option<TablePreview>,
     request_tx: Sender<WorkerRequest>,
     response_rx: Receiver<WorkerResponse>,
     next_request_id: u64,
