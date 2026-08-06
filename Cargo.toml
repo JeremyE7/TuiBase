@@ -1,0 +1,25 @@
+[package]
+name = "ase-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Extensible Ratatui database manager with a Sybase ASE/isql backend"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+crossterm = "0.29"
+dirs = "6.0"
+ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
+ratatui-textarea = "0.9.2"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+syntect = "5"
+syntect-tui = "3"
+arboard = "3.6.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

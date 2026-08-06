@@ -1,0 +1,28 @@
+# Copy this file to one of these locations:
+#   Windows: %APPDATA%\ase-tui\connections.toml
+#   Linux:   ~/.config/ase-tui/connections.toml
+#   macOS:   ~/Library/Application Support/ase-tui/connections.toml
+# Or keep it as ./connections.toml next to the executable.
+
+[[connections]]
+name = "ASE desarrollo"
+backend = "sybase_isql"
+isql_path = "isql"
+userstore_key = "ase_dev"
+database = "master"
+charset = "utf8"
+allow_writes = false
+extra_args = []
+
+# Less secure fallback. Prefer userstore_key.
+# [[connections]]
+# name = "ASE local"
+# backend = "sybase_isql"
+# isql_path = "C:/SAP/OCS-16_0/bin/isql.exe"
+# server = "ASE_LOCAL"
+# username = "usuario"
+# password_env = "ASE_LOCAL_PASSWORD"
+# database = "master"
+# charset = "utf8"
+# allow_writes = true
+# extra_args = ["-t", "30"]
