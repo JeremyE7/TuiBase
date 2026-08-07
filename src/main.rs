@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod db;
 mod editor;
+mod search;
 mod services;
 mod ui;
 mod worker;

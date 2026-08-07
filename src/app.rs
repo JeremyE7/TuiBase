@@ -7,6 +7,8 @@ use crossbeam_channel::{Receiver, Sender};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Text;
 use ratatui::widgets::{ScrollbarState, TableState};
+use ratatui_textarea::Input;
+use ratatui_textarea::TextArea;
 
 use crate::{
     config::{AppConfig, ConnectionProfile},
@@ -35,6 +37,24 @@ pub enum Focus {
     Kinds,
     Objects,
     Content,
+}
+
+pub struct SearchSession {
+    pub origin_focus: Focus,
+    pub input: TextArea<'static>,
+    pub suggestions: Vec<String>,
+    pub selected_suggestion: usize,
+}
+
+pub enum AppliedSearch {
+    Local {
+        focus: Focus,
+        query: String,
+    },
+    Global {
+        raw_path: String,
+        object_prefix: Option<String>,
+    },
 }
 
 impl Focus {
@@ -98,6 +118,8 @@ pub struct App {
     pub editor: Option<EditorSession>,
     pub should_quit: bool,
     pub busy_count: usize,
+    search: Option<SearchSession>,
+    active_search: Option<AppliedSearch>,
     pub table_preview: Option<TablePreview>,
     pub table_state: TableState,
     pub horizontal_scroll: ScrollbarState,
@@ -155,6 +177,8 @@ impl App {
             confirm_action: None,
             confirm_message: String::new(),
             return_to_editor_after_execution: false,
+            search: None,
+            active_search: None,
         }
     }
 
@@ -278,8 +302,21 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('/') => self.open_search(),
+
             _ => {}
         }
+    }
+
+    fn open_search(&mut self) {
+        self.search = Some(SearchSession {
+            origin_focus: self.focus,
+            input: TextArea::default(),
+            suggestions: Vec::new(),
+            selected_suggestion: 0,
+        });
+
+        self.mode = AppMode::Search;
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
@@ -393,33 +430,52 @@ impl App {
         }
     }
     fn handle_search_key(&mut self, key: KeyEvent) {
-        let command = match self.editor.as_mut() {
-            Some(session) => session.editor.handle_key(key),
-            None => {
+        if key.code == KeyCode::Esc {
+            self.search = None;
+            self.mode = AppMode::Browser;
+            return;
+        }
+
+        if key.code == KeyCode::Enter {
+            let Some(session) = self.search.take() else {
                 self.mode = AppMode::Browser;
                 return;
-            }
-        };
+            };
 
-        match command {
-            EditorCommand::None => {}
-            EditorCommand::Save => self.save_editor(),
-            EditorCommand::Close => {
-                let dirty = self
-                    .editor
-                    .as_ref()
-                    .is_some_and(|session| session.editor.is_dirty());
-                if dirty {
-                    self.confirm_action = Some(ConfirmAction::DiscardEditor);
-                    self.confirm_message =
-                        "Hay cambios sin ejecutar. ¿Cerrar el editor y descartarlos? [y/N]"
-                            .to_owned();
-                    self.mode = AppMode::Confirm;
-                } else {
-                    self.editor = None;
-                    self.mode = AppMode::Browser;
-                }
+            let query = session.input.lines().join("\n");
+
+            self.active_search = if query.is_empty() {
+                None
+            } else {
+                Some(match crate::search::classify_query(&query) {
+                    crate::search::SearchQuery::Local(text) => AppliedSearch::Local {
+                        focus: session.origin_focus,
+                        query: text,
+                    },
+                    crate::search::SearchQuery::Global(path) => AppliedSearch::Global {
+                        raw_path: query,
+                        object_prefix: path.object_prefix,
+                    },
+                })
+            };
+
+            self.mode = AppMode::Browser;
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+            if let Some(session) = self.search.as_mut() {
+                session.input = TextArea::default();
+                session.suggestions.clear();
+                session.selected_suggestion = 0;
             }
+
+            return;
+        }
+
+        if let Some(session) = self.search.as_mut() {
+            let input: Input = key.into();
+            session.input.input(input);
         }
     }
 
