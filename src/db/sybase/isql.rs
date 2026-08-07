@@ -267,7 +267,13 @@ impl DatabaseBackend for IsqlBackend {
         let columns = self
             .structured_rows(profile, database, &queries::table_columns(object))?
             .into_iter()
-            .filter_map(|row| row.into_iter().next())
+            .filter_map(|row| {
+                if row.len() < 2 {
+                    None
+                } else {
+                    Some((row[0].clone(), row[1].clone()))
+                }
+            })
             .collect::<Vec<_>>();
         if columns.is_empty() {
             bail!("La tabla no contiene columnas");

@@ -3,14 +3,16 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+    },
 };
 
 pub mod syntax;
 
 use crate::{
     app::{App, AppMode, Focus},
-    db::models::ObjectKind,
+    db::models::{ObjectKind, TablePreview},
 };
 
 pub use syntax::highlight_sql;
@@ -112,20 +114,46 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
         app.focus == Focus::Objects,
     );
 
-    let displayed_content = app
-        .highlighted_content
-        .clone()
-        .unwrap_or_else(|| Text::from(app.content.clone()));
-    let content = Paragraph::new(displayed_content)
+    if let Some(preview) = &app.table_preview {
+        render_table(frame, app, preview, workspace[1]);
+    } else {
+        let displayed_content = app
+            .highlighted_content
+            .clone()
+            .unwrap_or_else(|| Text::from(app.content.clone()));
+        let content = Paragraph::new(displayed_content)
+            .block(panel_block(
+                format!("[5] {} ", app.content_title),
+                app.focus == Focus::Content,
+            ))
+            .wrap(Wrap { trim: false })
+            .scroll((app.content_scroll, 0));
+        frame.render_widget(content, workspace[1]);
+    }
+
+    render_status(frame, vertical[1], app);
+}
+
+fn render_table(frame: &mut Frame<'_>, app: &App, preview: &TablePreview, area: Rect) {
+    let widths = vec![Constraint::Ratio(1, preview.columns.len() as u32); preview.columns.len()];
+
+    let header = Row::new(preview.columns.iter().map(|column| column.as_str()))
+        .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows = preview
+        .rows
+        .iter()
+        .map(|values| Row::new(values.iter().map(|value| value.as_str())));
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(1)
         .block(panel_block(
             format!("[5] {} ", app.content_title),
             app.focus == Focus::Content,
-        ))
-        .wrap(Wrap { trim: false })
-        .scroll((app.content_scroll, 0));
-    frame.render_widget(content, workspace[1]);
+        ));
 
-    render_status(frame, vertical[1], app);
+    frame.render_widget(table, area);
 }
 
 fn render_editor(frame: &mut Frame<'_>, app: &App) {

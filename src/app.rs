@@ -131,6 +131,7 @@ impl App {
             highlighted_content: None,
             content_scroll: 0,
             status: "Listo".to_owned(),
+            table_preview: None,
             last_key: String::new(),
             editor: None,
             should_quit: false,
@@ -766,6 +767,8 @@ impl App {
                             self.objects.len()
                         );
                         self.highlighted_content = None;
+                        self.table_preview = None;
+
                         self.status = format!("{} {} cargados", self.objects.len(), kind);
                     }
                     Err(error) => self.set_error(error),
@@ -798,6 +801,7 @@ impl App {
                         self.content_scroll = 0;
                         self.content = definition.clone();
                         self.highlighted_content = Some(ui::highlight_sql(&definition));
+                        self.table_preview = None;
                         self.current_content_object = Some(object.clone());
                         self.status = format!("Definición cargada: {}", object.qualified_name());
                         if requested_editor {
@@ -827,17 +831,12 @@ impl App {
                 }
                 match result {
                     Ok(output) => {
-                        self.content_title =
-                            format!("Datos · {} · máximo 100", object.qualified_name());
+                        self.content_title = format!("Datos · {} ", object.qualified_name());
                         self.content_scroll = 0;
-                        self.content = output.combined();
+                        self.table_preview = Some(output);
                         self.current_content_object = Some(object);
                         self.highlighted_content = None;
-                        self.status = if output.success {
-                            "Vista previa cargada".to_owned()
-                        } else {
-                            "La consulta terminó con errores".to_owned()
-                        };
+                        self.status = "Tabla cargada".to_owned();
                     }
                     Err(error) => self.set_error(error),
                 }
@@ -859,6 +858,7 @@ impl App {
                         self.content_scroll = 0;
                         self.content = output.combined();
                         self.highlighted_content = None;
+                        self.table_preview = None;
                         if output.success {
                             if let Some(session) = self.editor.as_mut() {
                                 session.editor.mark_clean();
@@ -901,6 +901,7 @@ impl App {
     fn set_error(&mut self, message: String) {
         self.status = format!("ERROR: {}", first_line(&message));
         self.highlighted_content = None;
+        self.table_preview = None;
         self.content_title = "Error".to_owned();
         self.content_scroll = 0;
         self.content = message;

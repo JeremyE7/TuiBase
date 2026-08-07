@@ -61,21 +61,36 @@ pub fn object_definition(object: &DbObject) -> String {
     );
 }
 
-pub fn preview_table(object: &DbObject, row_limit: usize, columns: &[String]) -> String {
+pub fn preview_table(object: &DbObject, row_limit: usize, columns: &[(String, String)]) -> String {
     let table = qualified_identifier(&object.owner, &object.name);
-    let header = string_literal(&columns.join("|"));
+    let header = columns
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+
+    let header = string_literal(&header);
 
     let row_expression = columns
         .iter()
-        .map(|column| {
-            format!(
-                "isnull(convert(varchar(255), {}), '<NULL>')",
-                quote_identifier(column)
-            )
+        .map(|(column, data_type)| {
+            let identifier = quote_identifier(column);
+
+            match data_type.to_ascii_lowercase().as_str() {
+                "image" => {
+                    format!(
+                        "case when {identifier} is null \
+                     then '<NULL>' \
+                     else '<IMAGE>' end"
+                    )
+                }
+                _ => {
+                    format!("isnull(convert(varchar(255), {identifier}), '<NULL>')")
+                }
+            }
         })
         .collect::<Vec<_>>()
         .join(" + '|' + ");
-
     return format!(
         "set nocount on\n\
          set quoted_identifier on\n\
@@ -126,9 +141,10 @@ pub fn table_columns(object: &DbObject) -> String {
 
     return format!(
         "set nocount on\n\
-         select '{ROW_MARKER}' + rtrim(c.name)\n\
-         from syscolumns c, sysobjects o\n\
+         select '{ROW_MARKER}' + rtrim(c.name) + '|' + rtrim(t.name)\n\
+         from syscolumns c, systypes t, sysobjects o\n\
          where c.id = o.id\n\
+           and c.usertype = t.usertype
            and o.name = '{name}'\n\
            and user_name(o.uid) = '{owner}'\n\
          order by c.colid\n"
