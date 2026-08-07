@@ -1,10 +1,12 @@
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
+    symbols::scrollbar::Set,
     text::{Line, Span, Text},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Table, Wrap,
     },
 };
 
@@ -12,14 +14,15 @@ pub mod syntax;
 
 use crate::{
     app::{App, AppMode, Focus},
-    db::models::{ObjectKind, TablePreview},
+    db::models::ObjectKind,
 };
 
 pub use syntax::highlight_sql;
 
-pub fn render(frame: &mut Frame<'_>, app: &App) {
+pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     match app.mode {
         AppMode::Editor => render_editor(frame, app),
+        AppMode::Table => render_full_table(frame, app),
         _ => render_browser(frame, app),
     }
 
@@ -114,8 +117,14 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
         app.focus == Focus::Objects,
     );
 
-    if let Some(preview) = &app.table_preview {
-        render_table(frame, app, preview, workspace[1]);
+    if app.table_preview.is_some() {
+        let content =
+            Paragraph::new("Preview disponible · Ctrl+F para abrir la tabla").block(panel_block(
+                format!("[5] {} ", app.content_title),
+                app.focus == Focus::Content,
+            ));
+
+        frame.render_widget(content, workspace[1]);
     } else {
         let displayed_content = app
             .highlighted_content
@@ -134,26 +143,95 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
     render_status(frame, vertical[1], app);
 }
 
-fn render_table(frame: &mut Frame<'_>, app: &App, preview: &TablePreview, area: Rect) {
-    let widths = vec![Constraint::Ratio(1, preview.columns.len() as u32); preview.columns.len()];
+fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(2), Constraint::Length(1)])
+        .split(frame.area());
+    let table_area = areas[0];
+    let scrollbar_area = areas[1];
 
-    let header = Row::new(preview.columns.iter().map(|column| column.as_str()))
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let Some(preview) = app.table_preview.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("No hay una tabla cargada").block(panel_block(" Tabla ", true)),
+            frame.area(),
+        );
+        return;
+    };
 
-    let rows = preview
-        .rows
-        .iter()
-        .map(|values| Row::new(values.iter().map(|value| value.as_str())));
+    if preview.columns.is_empty() {
+        frame.render_widget(
+            Paragraph::new("La tabla no tiene columnas").block(panel_block(" Tabla ", true)),
+            frame.area(),
+        );
+        return;
+    }
+
+    const COLUMN_WIDTH: usize = 18;
+    const COLUMN_SPACING: usize = 1;
+    let total_columns = preview.columns.len();
+    let available_width = table_area.width.saturating_sub(2) as usize;
+    let visible_columns = ((available_width + COLUMN_SPACING) / (COLUMN_WIDTH + COLUMN_SPACING))
+        .max(1)
+        .min(total_columns);
+    let max_offset = total_columns.saturating_sub(visible_columns);
+    let position = app.horizontal_scroll.get_position().min(max_offset);
+    let selected_column = app
+        .table_column_index
+        .saturating_sub(position)
+        .min(visible_columns.saturating_sub(1));
+
+    app.horizontal_scroll = ScrollbarState::new(total_columns)
+        .position(position)
+        .viewport_content_length(visible_columns);
+    app.table_visible_columns = visible_columns;
+    app.table_state.select_column(Some(selected_column));
+
+    let column_range = position..position + visible_columns;
+    let widths = vec![Constraint::Length(COLUMN_WIDTH as u16); visible_columns];
+
+    let header = Row::new(
+        column_range
+            .clone()
+            .map(|index| preview.columns[index].as_str()),
+    )
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows = preview.rows.iter().map(|values| {
+        Row::new(
+            column_range
+                .clone()
+                .map(|index| values.get(index).map(|value| value.as_str()).unwrap_or("")),
+        )
+    });
 
     let table = Table::new(rows, widths)
         .header(header)
-        .column_spacing(1)
+        .column_spacing(COLUMN_SPACING as u16)
+        .highlight_symbol("▸ ")
+        .row_highlight_style(Style::default().bg(Color::Black).fg(Color::Yellow))
+        .cell_highlight_style(Style::default().bg(Color::LightYellow).fg(Color::Black))
         .block(panel_block(
-            format!("[5] {} ", app.content_title),
-            app.focus == Focus::Content,
+            format!(" Tabla · {} · Esc salir ", app.content_title),
+            true,
         ));
 
-    frame.render_widget(table, area);
+    frame.render_stateful_widget(table, table_area, &mut app.table_state);
+
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom).symbols(Set {
+        track: "─",
+        thumb: "━",
+        begin: "‹",
+        end: "›",
+    });
+    frame.render_stateful_widget(
+        scrollbar,
+        scrollbar_area.inner(Margin {
+            vertical: 0,
+            horizontal: 1,
+        }),
+        &mut app.horizontal_scroll,
+    );
 }
 
 fn render_editor(frame: &mut Frame<'_>, app: &App) {

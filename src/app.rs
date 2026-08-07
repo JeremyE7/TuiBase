@@ -6,6 +6,7 @@ use crate::ui;
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Text;
+use ratatui::widgets::{ScrollbarState, TableState};
 
 use crate::{
     config::{AppConfig, ConnectionProfile},
@@ -24,6 +25,7 @@ pub enum AppMode {
     Confirm,
     Help,
     Search,
+    Table,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +99,10 @@ pub struct App {
     pub should_quit: bool,
     pub busy_count: usize,
     pub table_preview: Option<TablePreview>,
+    pub table_state: TableState,
+    pub horizontal_scroll: ScrollbarState,
+    pub table_column_index: usize,
+    pub table_visible_columns: usize,
     request_tx: Sender<WorkerRequest>,
     response_rx: Receiver<WorkerResponse>,
     next_request_id: u64,
@@ -132,6 +138,10 @@ impl App {
             content_scroll: 0,
             status: "Listo".to_owned(),
             table_preview: None,
+            table_state: TableState::default(),
+            horizontal_scroll: ScrollbarState::new(0),
+            table_column_index: 0,
+            table_visible_columns: 0,
             last_key: String::new(),
             editor: None,
             should_quit: false,
@@ -193,6 +203,7 @@ impl App {
             AppMode::Browser => self.handle_browser_key(key),
             AppMode::Editor => self.handle_editor_key(key),
             AppMode::Confirm => self.handle_confirm_key(key),
+            AppMode::Table => self.handle_table_key(key),
             AppMode::Search => self.handle_search_key(key),
             AppMode::Help => {
                 if matches!(
@@ -211,6 +222,19 @@ impl App {
             return;
         }
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+            if let Some(preview) = self.table_preview.as_ref() {
+                if !preview.rows.is_empty() {
+                    self.horizontal_scroll = ScrollbarState::new(preview.columns.len());
+                    self.table_column_index = 0;
+                    self.table_state.select_column(Some(0));
+                    self.table_state.select(Some(0));
+                    self.mode = AppMode::Table;
+                }
+            }
+
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Tab => self.focus = self.focus.next(),
@@ -289,6 +313,85 @@ impl App {
         }
     }
 
+    fn handle_table_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.mode = AppMode::Browser;
+            return;
+        }
+
+        let Some(preview) = self.table_preview.as_ref() else {
+            self.mode = AppMode::Browser;
+            return;
+        };
+
+        if preview.columns.is_empty() {
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if preview.rows.is_empty() {
+                    return;
+                }
+
+                let current = self.table_state.selected().unwrap_or(0);
+                let next = (current + 1).min(preview.rows.len() - 1);
+
+                self.table_state.select(Some(next));
+            }
+
+            KeyCode::Char('k') | KeyCode::Up => {
+                if preview.rows.is_empty() {
+                    return;
+                }
+
+                let current = self.table_state.selected().unwrap_or(0);
+                let previous = current.saturating_sub(1);
+
+                self.table_state.select(Some(previous));
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                let previous = self.table_column_index.saturating_sub(1);
+                self.table_column_index = previous;
+
+                if previous < self.horizontal_scroll.get_position() {
+                    self.horizontal_scroll.prev();
+                }
+            }
+
+            KeyCode::Char('l') | KeyCode::Right => {
+                let last_column = preview.columns.len().saturating_sub(1);
+                let next = self.table_column_index.saturating_add(1).min(last_column);
+                self.table_column_index = next;
+
+                let viewport_end = self
+                    .horizontal_scroll
+                    .get_position()
+                    .saturating_add(self.table_visible_columns.max(1));
+                if next >= viewport_end {
+                    self.horizontal_scroll.next();
+                }
+            }
+
+            KeyCode::Char('g') | KeyCode::Home => {
+                if preview.rows.is_empty() {
+                    return;
+                }
+
+                self.table_state.select(Some(0));
+            }
+
+            KeyCode::Char('G') | KeyCode::End => {
+                if preview.rows.is_empty() {
+                    return;
+                }
+
+                self.table_state.select(Some(preview.rows.len() - 1));
+            }
+
+            _ => {}
+        }
+    }
     fn handle_search_key(&mut self, key: KeyEvent) {
         let command = match self.editor.as_mut() {
             Some(session) => session.editor.handle_key(key),
@@ -833,6 +936,13 @@ impl App {
                     Ok(output) => {
                         self.content_title = format!("Datos · {} ", object.qualified_name());
                         self.content_scroll = 0;
+                        self.horizontal_scroll = ScrollbarState::new(output.columns.len());
+                        self.table_state = TableState::default();
+                        self.table_column_index = 0;
+                        self.table_visible_columns = 0;
+                        if !output.rows.is_empty() {
+                            self.table_state.select(Some(0));
+                        }
                         self.table_preview = Some(output);
                         self.current_content_object = Some(object);
                         self.highlighted_content = None;

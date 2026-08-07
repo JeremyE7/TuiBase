@@ -1,5 +1,7 @@
 use std::fmt;
 
+use ratatui::widgets::TableState;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
     Table,
@@ -21,7 +23,7 @@ impl ObjectKind {
     }
 
     pub fn editable(self) -> bool {
-        matches!(self, Self::Procedure | Self::Function | Self::View)
+        return matches!(self, Self::Procedure | Self::Function | Self::View);
     }
 }
 
@@ -33,7 +35,7 @@ impl fmt::Display for ObjectKind {
             Self::Function => "Funciones",
             Self::View => "Vistas",
         };
-        write!(f, "{text}")
+        return write!(f, "{text}");
     }
 }
 
@@ -46,7 +48,7 @@ pub struct DbObject {
 
 impl DbObject {
     pub fn qualified_name(&self) -> String {
-        format!("{}.{}", self.owner, self.name)
+        return format!("{}.{}", self.owner, self.name);
     }
 }
 
