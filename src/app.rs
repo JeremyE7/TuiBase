@@ -266,6 +266,13 @@ impl App {
 
             return;
         }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+            self.active_search = None;
+            self.object_index = 0;
+            self.status = "Búsqueda limpiada".to_owned();
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Tab => self.focus = self.focus.next(),
