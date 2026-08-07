@@ -1,3 +1,4 @@
+use std::fmt::format;
 use std::{collections::HashSet, path::PathBuf};
 
 use crate::db::models::TablePreview;
@@ -118,13 +119,13 @@ pub struct App {
     pub editor: Option<EditorSession>,
     pub should_quit: bool,
     pub busy_count: usize,
-    search: Option<SearchSession>,
-    active_search: Option<AppliedSearch>,
     pub table_preview: Option<TablePreview>,
     pub table_state: TableState,
     pub horizontal_scroll: ScrollbarState,
     pub table_column_index: usize,
     pub table_visible_columns: usize,
+    search: Option<SearchSession>,
+    active_search: Option<AppliedSearch>,
     request_tx: Sender<WorkerRequest>,
     response_rx: Receiver<WorkerResponse>,
     next_request_id: u64,
@@ -195,6 +196,10 @@ impl App {
         self.databases.get(self.database_index).map(String::as_str)
     }
 
+    pub fn current_search_session(&self) -> Option<&SearchSession> {
+        self.search.as_ref()
+    }
+
     pub fn active_database(&self) -> Option<&str> {
         self.current_database().or_else(|| {
             self.current_profile()
@@ -207,7 +212,9 @@ impl App {
     }
 
     pub fn current_object(&self) -> Option<&DbObject> {
-        self.objects.get(self.object_index)
+        let visible = self.visible_object_indices();
+        let real_index = *visible.get(self.object_index)?;
+        self.objects.get(real_index)
     }
 
     pub fn confirm_message(&self) -> &str {
@@ -317,6 +324,36 @@ impl App {
         });
 
         self.mode = AppMode::Search;
+    }
+
+    fn object_search_query(&self) -> Option<&str> {
+        match &self.active_search {
+            Some(AppliedSearch::Local {
+                focus: Focus::Objects,
+                query,
+            }) => Some(query.as_str()),
+            Some(AppliedSearch::Global {
+                object_prefix: Some(prefix),
+                ..
+            }) => Some(prefix.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn visible_object_indices(&self) -> Vec<usize> {
+        let query = self.object_search_query();
+
+        self.objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| {
+                let value = format!("{}{}", object.owner, object.name);
+                query
+                    .map(|query| crate::search::matches(&value, query))
+                    .unwrap_or(true)
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
@@ -460,6 +497,7 @@ impl App {
             };
 
             self.mode = AppMode::Browser;
+            self.object_index = 0;
             return;
         }
 
@@ -523,7 +561,8 @@ impl App {
                 self.kind_index = shifted_index(self.kind_index, ObjectKind::ALL.len(), delta);
             }
             Focus::Objects => {
-                self.object_index = shifted_index(self.object_index, self.objects.len(), delta);
+                let visible_len = self.visible_object_indices().len();
+                self.object_index = shifted_index(self.object_index, visible_len, delta);
             }
             Focus::Content => {
                 if delta < 0 {

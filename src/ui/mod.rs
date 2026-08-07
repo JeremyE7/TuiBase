@@ -29,6 +29,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     match app.mode {
         AppMode::Confirm => render_confirmation(frame, app),
         AppMode::Help => render_help(frame),
+        AppMode::Search => render_search_overlay(frame, app),
         _ => {}
     }
 }
@@ -104,8 +105,9 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
     );
 
     let objects = app
-        .objects
-        .iter()
+        .visible_object_indices()
+        .into_iter()
+        .filter_map(|index| app.objects.get(index))
         .map(|object| ListItem::new(format!("{}.{}", object.owner, object.name)))
         .collect::<Vec<_>>();
     render_list(
@@ -407,6 +409,55 @@ fn render_help(frame: &mut Frame<'_>) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_search_overlay(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(72, 42, frame.area());
+
+    frame.render_widget(Clear, area);
+
+    let outer_block = panel_block(" Buscar ", true);
+    let inner = outer_block.inner(area);
+
+    frame.render_widget(outer_block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(inner);
+
+    let Some(session) = app.current_search_session() else {
+        return;
+    };
+
+    let input_block = panel_block(" Consulta ", false);
+    let input_inner = input_block.inner(sections[0]);
+
+    frame.render_widget(input_block, sections[0]);
+    frame.render_widget(&session.input, input_inner);
+
+    let items = session
+        .suggestions
+        .iter()
+        .map(|suggestion| ListItem::new(suggestion.as_str()))
+        .collect::<Vec<_>>();
+
+    let mut state = ListState::default();
+
+    if !items.is_empty() {
+        state.select(Some(
+            session
+                .selected_suggestion
+                .min(items.len().saturating_sub(1)),
+        ));
+    }
+
+    let suggestions = List::new(items)
+        .block(panel_block(" Sugerencias ", false))
+        .highlight_symbol("▸ ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
+
+    frame.render_stateful_widget(suggestions, sections[1], &mut state)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
