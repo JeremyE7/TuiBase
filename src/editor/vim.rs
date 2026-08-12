@@ -218,7 +218,10 @@ impl VimEditor {
             _ => self.key_buffer.clear(),
         }
 
-        if !matches!(key.code, KeyCode::Char('g') | KeyCode::Char('d') | KeyCode::Char('y')) {
+        if !matches!(
+            key.code,
+            KeyCode::Char('g') | KeyCode::Char('d') | KeyCode::Char('y')
+        ) {
             self.key_buffer.clear();
         }
         EditorCommand::None
@@ -267,4 +270,3 @@ impl VimEditor {
         EditorCommand::None
     }
 }
-

@@ -98,6 +98,16 @@ impl IsqlBackend {
         database: &str,
         sql: &str,
     ) -> Result<Vec<Vec<String>>> {
+        self.structured_rows_with_empty(profile, database, sql, false)
+    }
+
+    fn structured_rows_with_empty(
+        &self,
+        profile: &ConnectionProfile,
+        database: &str,
+        sql: &str,
+        allow_empty: bool,
+    ) -> Result<Vec<Vec<String>>> {
         let output = self.run_sql(profile, database, sql)?;
 
         if !output.success {
@@ -117,7 +127,7 @@ impl IsqlBackend {
             })
             .collect::<Vec<_>>();
 
-        if rows.is_empty() {
+        if rows.is_empty() && !allow_empty {
             bail!(
                 "La consulta respondió, pero no se pudo interpretar la salida.\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
                 output.stdout,
@@ -157,7 +167,8 @@ impl DatabaseBackend for IsqlBackend {
         database: &str,
         kind: ObjectKind,
     ) -> Result<Vec<DbObject>> {
-        let rows = self.structured_rows(profile, database, &queries::list_objects(kind))?;
+        let rows =
+            self.structured_rows_with_empty(profile, database, &queries::list_objects(kind), true)?;
         Ok(rows
             .into_iter()
             .filter_map(|row| {

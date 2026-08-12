@@ -3,6 +3,7 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::{
+    catalog::{CachedConnection, CachedDatabase, CachedObject, cacheable_kinds},
     config::ConnectionProfile,
     db::{
         backend::DatabaseBackend,
@@ -52,6 +53,11 @@ pub enum WorkerRequest {
         sql: String,
         profile: ConnectionProfile,
     },
+    RefreshCatalog {
+        request_id: u64,
+        connection_index: usize,
+        profile: ConnectionProfile,
+    },
 }
 
 #[derive(Debug)]
@@ -93,6 +99,18 @@ pub enum WorkerResponse {
         database: String,
         result: Result<SqlOutput, String>,
     },
+    CatalogRefreshed {
+        request_id: u64,
+        connection_index: usize,
+        result: Result<CatalogRefreshResult, String>,
+    },
+}
+
+#[derive(Debug)]
+pub struct CatalogRefreshResult {
+    pub connection: CachedConnection,
+    pub skipped_databases: Vec<String>,
+    pub skipped_kinds: Vec<String>,
 }
 
 pub struct WorkerHandle {
@@ -213,7 +231,70 @@ fn execute_request(request: WorkerRequest) -> WorkerResponse {
                 result,
             }
         }
+        WorkerRequest::RefreshCatalog {
+            request_id,
+            connection_index,
+            profile,
+        } => {
+            let result = with_backend(&profile, |backend| {
+                let databases = backend.list_databases(&profile)?;
+                let mut cached_databases = Vec::with_capacity(databases.len());
+                let mut skipped_databases = Vec::new();
+                let mut skipped_kinds = Vec::new();
+
+                for database in databases {
+                    let mut objects = Vec::new();
+                    for kind in cacheable_kinds() {
+                        match backend.list_objects(&profile, &database, kind) {
+                            Ok(listed) => {
+                                objects.extend(listed.iter().map(CachedObject::from_db_object));
+                            }
+                            Err(error) if is_permission_error(&error) => {
+                                skipped_kinds.push(format!("{database}/{kind}"));
+                            }
+                            Err(error) => {
+                                skipped_databases.push(format!("{database}: {error:#}"));
+                                objects.clear();
+                                break;
+                            }
+                        }
+                    }
+
+                    if skipped_databases
+                        .iter()
+                        .any(|item| item.starts_with(&format!("{database}:")))
+                    {
+                        continue;
+                    }
+
+                    cached_databases.push(CachedDatabase {
+                        name: database,
+                        objects,
+                    });
+                }
+
+                Ok(CatalogRefreshResult {
+                    connection: CachedConnection::from_objects(&profile, cached_databases),
+                    skipped_databases,
+                    skipped_kinds,
+                })
+            });
+
+            WorkerResponse::CatalogRefreshed {
+                request_id,
+                connection_index,
+                result,
+            }
+        }
     }
+}
+
+fn is_permission_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("10351")
+        || message.contains("permission")
+        || message.contains("not authorized")
+        || message.contains("no access")
 }
 
 fn with_backend<T>(

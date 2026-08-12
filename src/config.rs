@@ -6,6 +6,8 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub connections: Vec<ConnectionProfile>,
+    #[serde(default = "default_catalog_ttl_hours")]
+    pub catalog_ttl_hours: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +35,10 @@ fn default_backend() -> String {
 
 fn default_isql_path() -> String {
     "isql".to_owned()
+}
+
+fn default_catalog_ttl_hours() -> u64 {
+    24
 }
 
 impl AppConfig {

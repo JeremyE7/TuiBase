@@ -4,6 +4,9 @@
 #   macOS:   ~/Library/Application Support/ase-tui/connections.toml
 # Or keep it as ./connections.toml next to the executable.
 
+# Disk catalog refresh interval. The default is 24 hours.
+catalog_ttl_hours = 24
+
 [[connections]]
 name = "ASE desarrollo"
 backend = "sybase_isql"

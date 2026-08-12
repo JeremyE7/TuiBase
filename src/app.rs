@@ -1,6 +1,10 @@
-use std::fmt::format;
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
+use crate::catalog::{CatalogCache, CatalogEntry, connection_key};
 use crate::db::models::TablePreview;
 use crate::services;
 use crate::ui;
@@ -8,8 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Text;
 use ratatui::widgets::{ScrollbarState, TableState};
-use ratatui_textarea::Input;
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, Input, TextArea};
 
 use crate::{
     config::{AppConfig, ConnectionProfile},
@@ -41,21 +44,9 @@ pub enum Focus {
 }
 
 pub struct SearchSession {
-    pub origin_focus: Focus,
     pub input: TextArea<'static>,
-    pub suggestions: Vec<String>,
+    pub suggestions: Vec<CatalogEntry>,
     pub selected_suggestion: usize,
-}
-
-pub enum AppliedSearch {
-    Local {
-        focus: Focus,
-        query: String,
-    },
-    Global {
-        raw_path: String,
-        object_prefix: Option<String>,
-    },
 }
 
 impl Focus {
@@ -125,7 +116,11 @@ pub struct App {
     pub table_column_index: usize,
     pub table_visible_columns: usize,
     search: Option<SearchSession>,
-    active_search: Option<AppliedSearch>,
+    active_search: Option<String>,
+    catalog: CatalogCache,
+    catalog_refresh_pending: HashSet<usize>,
+    pending_catalog_target: Option<CatalogEntry>,
+    last_catalog_refresh_check: Instant,
     request_tx: Sender<WorkerRequest>,
     response_rx: Receiver<WorkerResponse>,
     next_request_id: u64,
@@ -144,6 +139,8 @@ impl App {
         request_tx: Sender<WorkerRequest>,
         response_rx: Receiver<WorkerResponse>,
     ) -> Self {
+        let catalog = CatalogCache::load().unwrap_or_default();
+
         Self {
             config,
             config_path,
@@ -180,12 +177,17 @@ impl App {
             return_to_editor_after_execution: false,
             search: None,
             active_search: None,
+            catalog,
+            catalog_refresh_pending: HashSet::new(),
+            pending_catalog_target: None,
+            last_catalog_refresh_check: Instant::now(),
         }
     }
 
     pub fn bootstrap(&mut self) {
         self.test_connection();
         self.load_databases();
+        self.maybe_refresh_catalog(false);
     }
 
     pub fn current_profile(&self) -> Option<&ConnectionProfile> {
@@ -212,19 +214,24 @@ impl App {
     }
 
     pub fn current_object(&self) -> Option<&DbObject> {
-        let visible = self.visible_object_indices();
-        let real_index = *visible.get(self.object_index)?;
-        self.objects.get(real_index)
+        self.objects.get(self.object_index)
     }
 
     pub fn confirm_message(&self) -> &str {
         &self.confirm_message
     }
 
+    pub fn active_search_label(&self) -> Option<String> {
+        self.active_search
+            .as_ref()
+            .map(|query| format!("Buscar global: {query}"))
+    }
+
     pub fn poll_worker(&mut self) {
         while let Ok(response) = self.response_rx.try_recv() {
             self.handle_worker_response(response);
         }
+        self.maybe_refresh_catalog(false);
         self.busy_count = self.pending_requests.len();
     }
 
@@ -253,24 +260,8 @@ impl App {
             return;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
-            if let Some(preview) = self.table_preview.as_ref() {
-                if !preview.rows.is_empty() {
-                    self.horizontal_scroll = ScrollbarState::new(preview.columns.len());
-                    self.table_column_index = 0;
-                    self.table_state.select_column(Some(0));
-                    self.table_state.select(Some(0));
-                    self.mode = AppMode::Table;
-                }
-            }
-
-            return;
-        }
-
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
-            self.active_search = None;
-            self.object_index = 0;
-            self.status = "Búsqueda limpiada".to_owned();
+            self.status = "Búsqueda global: usa / para buscar en el catálogo".to_owned();
             return;
         }
         match key.code {
@@ -290,7 +281,6 @@ impl App {
             KeyCode::Char('r') => self.refresh_current(),
             KeyCode::Char('R') => self.reload_connections(),
             KeyCode::Char('c') => self.test_connection(),
-            KeyCode::Char('p') => self.preview_selected_table(),
             KeyCode::Char('e') => self.edit_selected_object(),
             KeyCode::Char('E') => self.edit_table_values(),
             KeyCode::Char(':') => self.open_query_editor(),
@@ -317,6 +307,7 @@ impl App {
                 }
             }
             KeyCode::Char('/') => self.open_search(),
+            KeyCode::F(5) => self.refresh_catalog(),
 
             _ => {}
         }
@@ -324,43 +315,13 @@ impl App {
 
     fn open_search(&mut self) {
         self.search = Some(SearchSession {
-            origin_focus: self.focus,
             input: TextArea::default(),
             suggestions: Vec::new(),
             selected_suggestion: 0,
         });
 
         self.mode = AppMode::Search;
-    }
-
-    fn object_search_query(&self) -> Option<&str> {
-        match &self.active_search {
-            Some(AppliedSearch::Local {
-                focus: Focus::Objects,
-                query,
-            }) => Some(query.as_str()),
-            Some(AppliedSearch::Global {
-                object_prefix: Some(prefix),
-                ..
-            }) => Some(prefix.as_str()),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn visible_object_indices(&self) -> Vec<usize> {
-        let query = self.object_search_query();
-
-        self.objects
-            .iter()
-            .enumerate()
-            .filter(|(_, object)| {
-                let value = format!("{}{}", object.owner, object.name);
-                query
-                    .map(|query| crate::search::matches(&value, query))
-                    .unwrap_or(true)
-            })
-            .map(|(index, _)| index)
-            .collect()
+        self.refresh_search_suggestions();
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
@@ -396,6 +357,7 @@ impl App {
 
     fn handle_table_key(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.table_preview = None;
             self.mode = AppMode::Browser;
             return;
         }
@@ -480,41 +442,55 @@ impl App {
             return;
         }
 
+        if key.code == KeyCode::Tab {
+            self.accept_search_suggestion();
+            return;
+        }
+
+        if key.code == KeyCode::Up {
+            self.move_search_suggestion(-1);
+            return;
+        }
+
+        if key.code == KeyCode::Down {
+            self.move_search_suggestion(1);
+            return;
+        }
+
         if key.code == KeyCode::Enter {
             let Some(session) = self.search.take() else {
                 self.mode = AppMode::Browser;
                 return;
             };
 
-            let query = session.input.lines().join("\n");
-
-            self.active_search = if query.is_empty() {
-                None
-            } else {
-                Some(match crate::search::classify_query(&query) {
-                    crate::search::SearchQuery::Local(text) => AppliedSearch::Local {
-                        focus: session.origin_focus,
-                        query: text,
-                    },
-                    crate::search::SearchQuery::Global(path) => AppliedSearch::Global {
-                        raw_path: query,
-                        object_prefix: path.object_prefix,
-                    },
-                })
-            };
-
+            let query = session.input.lines().join("\n").trim().to_owned();
             self.mode = AppMode::Browser;
-            self.object_index = 0;
+
+            if query.is_empty() {
+                return;
+            }
+
+            self.active_search = Some(query);
+            if let Some(entry) = session
+                .suggestions
+                .get(session.selected_suggestion)
+                .cloned()
+            {
+                self.navigate_to_catalog_entry(entry);
+            } else {
+                self.status = "No hay coincidencias en el catálogo".to_owned();
+            }
             return;
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
             if let Some(session) = self.search.as_mut() {
                 session.input = TextArea::default();
-                session.suggestions.clear();
                 session.selected_suggestion = 0;
             }
 
+            self.active_search = None;
+            self.refresh_search_suggestions();
             return;
         }
 
@@ -522,6 +498,194 @@ impl App {
             let input: Input = key.into();
             session.input.input(input);
         }
+
+        self.refresh_search_suggestions();
+    }
+
+    fn move_search_suggestion(&mut self, delta: isize) {
+        let Some(session) = self.search.as_mut() else {
+            return;
+        };
+
+        if session.suggestions.is_empty() {
+            return;
+        }
+
+        session.selected_suggestion = shifted_index(
+            session.selected_suggestion,
+            session.suggestions.len(),
+            delta,
+        );
+    }
+
+    fn accept_search_suggestion(&mut self) {
+        let suggestion = self.search.as_ref().and_then(|session| {
+            session
+                .suggestions
+                .get(session.selected_suggestion)
+                .cloned()
+        });
+
+        let Some(suggestion) = suggestion else {
+            return;
+        };
+
+        let mut input = search_input(&suggestion.path());
+        input.move_cursor(CursorMove::End);
+
+        if let Some(session) = self.search.as_mut() {
+            session.input = input;
+        }
+
+        self.refresh_search_suggestions();
+    }
+
+    fn refresh_search_suggestions(&mut self) {
+        let Some(query) = self
+            .search
+            .as_ref()
+            .map(|session| session.input.lines().join("\n"))
+        else {
+            return;
+        };
+
+        let suggestions = self.search_suggestions(&query);
+
+        if let Some(session) = self.search.as_mut() {
+            session.suggestions = suggestions;
+            session.selected_suggestion = session
+                .selected_suggestion
+                .min(session.suggestions.len().saturating_sub(1));
+        }
+    }
+
+    fn search_suggestions(&self, query: &str) -> Vec<CatalogEntry> {
+        let query = query.trim();
+        self.catalog
+            .entries()
+            .into_iter()
+            .filter(|entry| {
+                query.is_empty()
+                    || crate::search::matches(&entry.search_text(), query)
+                    || crate::search::matches(&entry.path(), query)
+            })
+            .take(8)
+            .collect()
+    }
+
+    fn navigate_to_catalog_entry(&mut self, entry: CatalogEntry) {
+        let Some(connection_index) = self
+            .config
+            .connections
+            .iter()
+            .position(|profile| connection_key(profile) == entry.connection_key)
+        else {
+            self.status = "La conexión del catálogo ya no existe".to_owned();
+            return;
+        };
+
+        self.connection_index = connection_index;
+
+        let Some(database_index) = self
+            .databases
+            .iter()
+            .position(|database| database == &entry.database)
+        else {
+            self.pending_catalog_target = Some(entry);
+            self.database_index = 0;
+            self.load_databases();
+            self.status = "Cargando la base del resultado...".to_owned();
+            return;
+        };
+        self.database_index = database_index;
+
+        let Some(kind) = entry.object_kind() else {
+            self.focus = Focus::Databases;
+            self.status = format!("Base seleccionada: {}", entry.database);
+            return;
+        };
+        self.kind_index = ObjectKind::ALL
+            .iter()
+            .position(|candidate| *candidate == kind)
+            .unwrap_or(0);
+
+        let object = DbObject {
+            owner: entry.owner.unwrap_or_else(|| "dbo".to_owned()),
+            name: entry.name,
+            kind,
+        };
+
+        if self.objects.iter().any(|candidate| candidate == &object) {
+            self.object_index = self
+                .objects
+                .iter()
+                .position(|candidate| candidate == &object)
+                .unwrap_or(0);
+            self.focus = Focus::Objects;
+            self.open_selected_object(object);
+        } else {
+            self.pending_catalog_target = Some(CatalogEntry {
+                owner: Some(object.owner),
+                name: object.name,
+                ..entry
+            });
+            self.objects.clear();
+            self.object_index = 0;
+            self.load_objects();
+            self.status = "Cargando el objeto del resultado...".to_owned();
+        }
+    }
+
+    fn open_selected_object(&mut self, object: DbObject) {
+        if object.kind == ObjectKind::Table {
+            self.preview_selected_table();
+        } else {
+            self.load_definition(false);
+        }
+    }
+
+    fn maybe_refresh_catalog(&mut self, force: bool) {
+        if !force && self.last_catalog_refresh_check.elapsed() < Duration::from_secs(30) {
+            return;
+        }
+        self.last_catalog_refresh_check = Instant::now();
+
+        let refresh_indices = self
+            .config
+            .connections
+            .iter()
+            .enumerate()
+            .filter_map(|(index, profile)| {
+                let needs_refresh = force
+                    || self
+                        .catalog
+                        .needs_refresh_for(profile, self.config.catalog_ttl_hours);
+                (needs_refresh && !self.catalog_refresh_pending.contains(&index)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        for index in refresh_indices {
+            self.request_catalog_refresh(index);
+        }
+    }
+
+    fn refresh_catalog(&mut self) {
+        self.maybe_refresh_catalog(true);
+        self.status = "Actualizando catálogo...".to_owned();
+    }
+
+    fn request_catalog_refresh(&mut self, connection_index: usize) {
+        let Some(profile) = self.config.connections.get(connection_index).cloned() else {
+            return;
+        };
+        let request_id =
+            self.begin_request(format!("Actualizando catálogo de {}...", profile.name));
+        self.catalog_refresh_pending.insert(connection_index);
+        self.send(WorkerRequest::RefreshCatalog {
+            request_id,
+            connection_index,
+            profile,
+        });
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) {
@@ -568,8 +732,7 @@ impl App {
                 self.kind_index = shifted_index(self.kind_index, ObjectKind::ALL.len(), delta);
             }
             Focus::Objects => {
-                let visible_len = self.visible_object_indices().len();
-                self.object_index = shifted_index(self.object_index, visible_len, delta);
+                self.object_index = shifted_index(self.object_index, self.objects.len(), delta);
             }
             Focus::Content => {
                 if delta < 0 {
@@ -607,7 +770,13 @@ impl App {
                 self.load_databases();
             }
             Focus::Databases | Focus::Kinds => self.load_objects(),
-            Focus::Objects => self.load_definition(false),
+            Focus::Objects => {
+                if self.current_kind() == ObjectKind::Table {
+                    self.preview_selected_table();
+                } else {
+                    self.load_definition(false);
+                }
+            }
             Focus::Content => {}
         }
     }
@@ -635,9 +804,10 @@ impl App {
                 let selected_name = self.current_profile().map(|p| p.name.clone());
                 self.config = config;
                 self.config_path = path;
-                self.connection_index = selected_name
+                let selected_raw_index = selected_name
                     .and_then(|name| self.config.connections.iter().position(|p| p.name == name))
                     .unwrap_or(0);
+                self.connection_index = selected_raw_index;
                 self.databases.clear();
                 self.objects.clear();
                 self.status = "Conexiones recargadas desde disco".to_owned();
@@ -655,10 +825,11 @@ impl App {
             self.set_error("No hay una conexión seleccionada".to_owned());
             return;
         };
+        let connection_index = self.connection_index;
         let request_id = self.begin_request("Probando conexión...");
         self.send(WorkerRequest::TestConnection {
             request_id,
-            connection_index: self.connection_index,
+            connection_index,
             profile,
         });
     }
@@ -667,10 +838,11 @@ impl App {
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
+        let connection_index = self.connection_index;
         let request_id = self.begin_request("Cargando bases de datos...");
         self.send(WorkerRequest::LoadDatabases {
             request_id,
-            connection_index: self.connection_index,
+            connection_index,
             profile,
         });
     }
@@ -679,6 +851,7 @@ impl App {
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
+        let connection_index = self.connection_index;
         let Some(database) = self.current_database().map(ToOwned::to_owned) else {
             self.set_error("Selecciona una base de datos".to_owned());
             return;
@@ -687,7 +860,7 @@ impl App {
         let request_id = self.begin_request(format!("Cargando {kind} de {database}..."));
         self.send(WorkerRequest::LoadObjects {
             request_id,
-            connection_index: self.connection_index,
+            connection_index,
             database,
             kind,
             profile,
@@ -698,6 +871,7 @@ impl App {
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
+        let connection_index = self.connection_index;
         let Some(database) = self.current_database().map(ToOwned::to_owned) else {
             return;
         };
@@ -711,7 +885,7 @@ impl App {
         }
         self.send(WorkerRequest::LoadDefinition {
             request_id,
-            connection_index: self.connection_index,
+            connection_index,
             database,
             object,
             profile,
@@ -730,13 +904,14 @@ impl App {
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
+        let connection_index = self.connection_index;
         let Some(database) = self.current_database().map(ToOwned::to_owned) else {
             return;
         };
         let request_id = self.begin_request(format!("Consultando {}...", object.qualified_name()));
         self.send(WorkerRequest::PreviewTable {
             request_id,
-            connection_index: self.connection_index,
+            connection_index,
             database,
             object,
             row_limit: 100,
@@ -878,6 +1053,7 @@ impl App {
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
+        let connection_index = self.connection_index;
         let database = self
             .active_database()
             .map(ToOwned::to_owned)
@@ -885,7 +1061,7 @@ impl App {
         let request_id = self.begin_request(format!("Ejecutando T-SQL en {database}..."));
         self.send(WorkerRequest::ExecuteSql {
             request_id,
-            connection_index: self.connection_index,
+            connection_index,
             database,
             sql,
             profile,
@@ -904,7 +1080,8 @@ impl App {
             | WorkerResponse::ObjectsLoaded { request_id, .. }
             | WorkerResponse::DefinitionLoaded { request_id, .. }
             | WorkerResponse::TablePreviewed { request_id, .. }
-            | WorkerResponse::SqlExecuted { request_id, .. } => *request_id,
+            | WorkerResponse::SqlExecuted { request_id, .. }
+            | WorkerResponse::CatalogRefreshed { request_id, .. } => *request_id,
         };
         self.pending_requests.remove(&request_id);
 
@@ -914,7 +1091,7 @@ impl App {
                 result,
                 ..
             } => {
-                if connection_index != self.connection_index {
+                if self.connection_index != connection_index {
                     return;
                 }
                 match result {
@@ -927,7 +1104,7 @@ impl App {
                 result,
                 ..
             } => {
-                if connection_index != self.connection_index {
+                if self.connection_index != connection_index {
                     return;
                 }
                 match result {
@@ -936,11 +1113,14 @@ impl App {
                             .current_profile()
                             .map(|profile| profile.initial_database().to_owned());
                         self.databases = databases;
-                        self.database_index = preferred
+                        let preferred_raw_index = preferred
                             .and_then(|name| self.databases.iter().position(|db| db == &name))
                             .unwrap_or(0);
+                        self.database_index = preferred_raw_index;
                         self.status = format!("{} bases disponibles", self.databases.len());
-                        if !self.databases.is_empty() {
+                        if let Some(target) = self.pending_catalog_target.take() {
+                            self.navigate_to_catalog_entry(target);
+                        } else if !self.databases.is_empty() {
                             self.load_objects();
                         }
                     }
@@ -954,7 +1134,7 @@ impl App {
                 result,
                 ..
             } => {
-                if connection_index != self.connection_index
+                if self.connection_index != connection_index
                     || self.current_database() != Some(database.as_str())
                     || self.current_kind() != kind
                 {
@@ -968,13 +1148,16 @@ impl App {
                         self.content_title = format!("{kind} · {database}");
                         self.content_scroll = 0;
                         self.content = format!(
-                            "{} objetos encontrados. Enter abre la definición; 'e' edita; 'p' previsualiza tablas.",
+                            "{} objetos encontrados. Enter abre la tabla o definición; 'e' edita.",
                             self.objects.len()
                         );
                         self.highlighted_content = None;
                         self.table_preview = None;
 
                         self.status = format!("{} {} cargados", self.objects.len(), kind);
+                        if let Some(target) = self.pending_catalog_target.take() {
+                            self.navigate_to_catalog_entry(target);
+                        }
                     }
                     Err(error) => self.set_error(error),
                 }
@@ -991,7 +1174,7 @@ impl App {
                         *pending_id == request_id && pending_object == &object
                     },
                 );
-                if connection_index != self.connection_index
+                if self.connection_index != connection_index
                     || self.current_database() != Some(database.as_str())
                 {
                     if requested_editor {
@@ -1029,7 +1212,7 @@ impl App {
                 result,
                 ..
             } => {
-                if connection_index != self.connection_index
+                if self.connection_index != connection_index
                     || self.current_database() != Some(database.as_str())
                 {
                     return;
@@ -1048,6 +1231,7 @@ impl App {
                         self.table_preview = Some(output);
                         self.current_content_object = Some(object);
                         self.highlighted_content = None;
+                        self.mode = AppMode::Table;
                         self.status = "Tabla cargada".to_owned();
                     }
                     Err(error) => self.set_error(error),
@@ -1059,7 +1243,7 @@ impl App {
                 result,
                 ..
             } => {
-                if connection_index != self.connection_index
+                if self.connection_index != connection_index
                     || self.active_database() != Some(database.as_str())
                 {
                     return;
@@ -1089,8 +1273,45 @@ impl App {
                 };
                 self.return_to_editor_after_execution = false;
             }
+            WorkerResponse::CatalogRefreshed {
+                connection_index,
+                result,
+                ..
+            } => {
+                self.catalog_refresh_pending.remove(&connection_index);
+                match result {
+                    Ok(refresh) => {
+                        let skipped_databases = refresh.skipped_databases.len();
+                        let skipped_kinds = refresh.skipped_kinds.len();
+                        self.catalog.upsert(refresh.connection);
+                        if let Err(error) = self.catalog.save() {
+                            self.status =
+                                format!("Catálogo actualizado, pero no guardado: {error:#}");
+                        } else if skipped_databases > 0 || skipped_kinds > 0 {
+                            self.status = format!(
+                                "Catálogo actualizado · {} bases omitidas · {} categorías omitidas",
+                                skipped_databases, skipped_kinds
+                            );
+                        } else {
+                            self.status = "Catálogo actualizado".to_owned();
+                        }
+                        self.refresh_search_suggestions();
+                        self.resolve_pending_catalog_target();
+                    }
+                    Err(error) => {
+                        self.status = format!("No se pudo actualizar el catálogo: {error}");
+                    }
+                }
+            }
         }
         self.busy_count = self.pending_requests.len();
+    }
+
+    fn resolve_pending_catalog_target(&mut self) {
+        let Some(target) = self.pending_catalog_target.take() else {
+            return;
+        };
+        self.navigate_to_catalog_entry(target);
     }
 
     fn begin_request(&mut self, status: impl Into<String>) -> u64 {
@@ -1118,6 +1339,14 @@ impl App {
         self.content_scroll = 0;
         self.content = message;
     }
+}
+
+fn search_input(text: &str) -> TextArea<'static> {
+    if text.is_empty() {
+        return TextArea::default();
+    }
+
+    text.lines().map(ToOwned::to_owned).collect()
 }
 
 fn shifted_index(current: usize, len: usize, delta: isize) -> usize {

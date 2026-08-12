@@ -105,9 +105,8 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
     );
 
     let objects = app
-        .visible_object_indices()
-        .into_iter()
-        .filter_map(|index| app.objects.get(index))
+        .objects
+        .iter()
         .map(|object| ListItem::new(format!("{}.{}", object.owner, object.name)))
         .collect::<Vec<_>>();
     render_list(
@@ -119,28 +118,18 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
         app.focus == Focus::Objects,
     );
 
-    if app.table_preview.is_some() {
-        let content =
-            Paragraph::new("Preview disponible · Ctrl+F para abrir la tabla").block(panel_block(
-                format!("[5] {} ", app.content_title),
-                app.focus == Focus::Content,
-            ));
-
-        frame.render_widget(content, workspace[1]);
-    } else {
-        let displayed_content = app
-            .highlighted_content
-            .clone()
-            .unwrap_or_else(|| Text::from(app.content.clone()));
-        let content = Paragraph::new(displayed_content)
-            .block(panel_block(
-                format!("[5] {} ", app.content_title),
-                app.focus == Focus::Content,
-            ))
-            .wrap(Wrap { trim: false })
-            .scroll((app.content_scroll, 0));
-        frame.render_widget(content, workspace[1]);
-    }
+    let displayed_content = app
+        .highlighted_content
+        .clone()
+        .unwrap_or_else(|| Text::from(app.content.clone()));
+    let content = Paragraph::new(displayed_content)
+        .block(panel_block(
+            format!("[5] {} ", app.content_title),
+            app.focus == Focus::Content,
+        ))
+        .wrap(Wrap { trim: false })
+        .scroll((app.content_scroll, 0));
+    frame.render_widget(content, workspace[1]);
 
     render_status(frame, vertical[1], app);
 }
@@ -334,6 +323,10 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         })
         .unwrap_or_else(|| "sin conexión".to_owned());
     let database = app.active_database().unwrap_or("-");
+    let search = app
+        .active_search_label()
+        .map(|label| format!(" · {label}"))
+        .unwrap_or_default();
     let busy = if app.busy_count > 0 {
         format!(" · tareas:{}", app.busy_count)
     } else {
@@ -344,15 +337,36 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .as_ref()
         .map(|session| format!(" · {}", session.editor.mode))
         .unwrap_or_default();
-    let left = format!(
-        " {:?}{} · {} · {}{} · {} ",
-        app.mode, editor_mode, profile, database, busy, app.status
-    );
+
+    let status_style = if app.status.starts_with("ERROR") || app.status.starts_with("No se pudo") {
+        Style::default().fg(Color::LightRed)
+    } else if app.busy_count > 0 || app.status.contains("Actualizando") {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::LightGreen)
+    };
+    let left = Line::from(vec![
+        Span::styled(
+            format!(" {:?}{} ", app.mode, editor_mode),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled("· ", Style::default().fg(Color::DarkGray)),
+        Span::styled(profile, Style::default().fg(Color::LightBlue)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(database, Style::default().fg(Color::White)),
+        Span::styled(search, Style::default().fg(Color::Magenta)),
+        Span::styled(busy, Style::default().fg(Color::Yellow)),
+        Span::styled(format!(" · {} ", app.status), status_style),
+    ]);
     frame.render_widget(Paragraph::new(left), split[0]);
     frame.render_widget(
         Paragraph::new(format!(" {} ", app.last_key))
             .alignment(Alignment::Right)
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+            .style(
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         split[1],
     );
 }
@@ -384,7 +398,7 @@ fn render_help(frame: &mut Frame<'_>) {
         "  h/l o Tab     cambiar panel      j/k        mover selección",
         "  Enter         abrir/cargar        r          recargar panel",
         "  R             recargar conexiones c          probar conexión",
-        "  p             preview tabla       e          editar SP/función/vista",
+        "  Enter         tabla/detalle       e          editar SP/función/vista",
         "  E             editar datos T-SQL  :          consulta T-SQL",
         "  ?             ayuda               q          salir",
         "",
@@ -439,7 +453,7 @@ fn render_search_overlay(frame: &mut Frame<'_>, app: &App) {
     let items = session
         .suggestions
         .iter()
-        .map(|suggestion| ListItem::new(suggestion.as_str()))
+        .map(|suggestion| ListItem::new(suggestion.display_line()))
         .collect::<Vec<_>>();
 
     let mut state = ListState::default();
