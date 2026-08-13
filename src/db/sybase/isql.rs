@@ -9,7 +9,11 @@ use crate::{
     config::ConnectionProfile,
     db::{
         backend::DatabaseBackend,
-        models::{DbObject, ObjectKind, SqlOutput, TablePreview},
+        models::{
+            ColumnMetadata, DbObject, IndexMetadata, ObjectKind, SqlOutput, TableMetadata,
+            TablePage, TablePreview,
+        },
+        query::{PageCursor, TableQuery},
     },
 };
 
@@ -302,6 +306,66 @@ impl DatabaseBackend for IsqlBackend {
         parse_table_preview(&output.stdout)
     }
 
+    fn table_metadata(
+        &self,
+        profile: &ConnectionProfile,
+        database: &str,
+        object: &DbObject,
+    ) -> Result<TableMetadata> {
+        let rows = self.structured_rows_with_empty(
+            profile,
+            database,
+            &queries::table_metadata(object),
+            true,
+        )?;
+        parse_table_metadata(queries::table_identifier(object), rows)
+    }
+
+    fn query_table(
+        &self,
+        profile: &ConnectionProfile,
+        database: &str,
+        object: &DbObject,
+        query: &TableQuery,
+    ) -> Result<TablePage> {
+        if query.page.limit == 0 {
+            bail!("El límite de la página debe ser mayor que cero");
+        }
+        if matches!(query.page.cursor.as_ref(), Some(PageCursor::Keyset(_))) {
+            bail!("El backend ASE todavía no admite cursores keyset");
+        }
+
+        let offset = query.page.cursor.as_ref().map_or(0, cursor_offset);
+        let offset =
+            usize::try_from(offset).context("El offset de la página es demasiado grande")?;
+        let metadata = self.table_metadata(profile, database, object)?;
+        let columns = metadata
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let output = self.run_sql(
+            profile,
+            database,
+            &queries::query_table(object, query, &columns),
+        )?;
+
+        if !output.success {
+            bail!("No se pudo consultar la tabla: {}", output.combined());
+        }
+
+        let page = parse_table_preview(&output.stdout)?;
+        let mut rows = page.rows.into_iter().skip(offset).collect::<Vec<_>>();
+        let has_more = rows.len() > query.page.limit;
+        if has_more {
+            rows.truncate(query.page.limit);
+        }
+        let next_cursor =
+            has_more.then(|| PageCursor::Offset((offset as u64).saturating_add(rows.len() as u64)));
+
+        TablePage::new(page.columns, rows, next_cursor, has_more, None).map_err(Into::into)
+    }
+
     fn execute(&self, profile: &ConnectionProfile, database: &str, sql: &str) -> Result<SqlOutput> {
         self.run_sql(profile, database, sql)
     }
@@ -363,6 +427,77 @@ fn parse_table_preview(table: &str) -> Result<TablePreview> {
     Ok(TablePreview { columns, rows })
 }
 
+fn parse_optional_u32(value: &str) -> Option<u32> {
+    value.parse().ok()
+}
+
+fn parse_table_metadata(
+    identifier: crate::db::models::TableIdentifier,
+    rows: Vec<Vec<String>>,
+) -> Result<TableMetadata> {
+    let mut columns = Vec::new();
+    let mut index_rows = Vec::new();
+
+    for row in rows {
+        let Some(kind) = row.first().map(String::as_str) else {
+            continue;
+        };
+
+        match kind {
+            "COLUMN" if row.len() >= 8 => columns.push(ColumnMetadata {
+                name: row[1].clone(),
+                data_type: row[2].clone(),
+                length: parse_optional_u32(&row[3]),
+                precision: parse_optional_u32(&row[4]),
+                scale: parse_optional_u32(&row[5]),
+                nullable: row[6] == "1",
+                ordinal_position: row[7].parse().unwrap_or(columns.len() + 1),
+            }),
+            "INDEX" if row.len() >= 20 => index_rows.push(row),
+            _ => {}
+        }
+    }
+
+    if columns.is_empty() {
+        bail!("La tabla no contiene columnas");
+    }
+
+    let indexes = index_rows
+        .into_iter()
+        .map(|row| {
+            let columns = row
+                .iter()
+                .skip(4)
+                .take(16)
+                .filter_map(|value| value.parse::<usize>().ok())
+                .filter(|ordinal| *ordinal > 0)
+                .filter_map(|ordinal| {
+                    columns
+                        .iter()
+                        .find(|column| column.ordinal_position == ordinal)
+                        .map(|column| column.name.clone())
+                })
+                .collect();
+
+            IndexMetadata {
+                name: row[1].clone(),
+                columns,
+                is_unique: row[2] == "1",
+                is_primary: row[3] == "1",
+            }
+        })
+        .collect();
+
+    Ok(TableMetadata::new(identifier, columns, indexes))
+}
+
+fn cursor_offset(cursor: &PageCursor) -> u64 {
+    match cursor {
+        PageCursor::Offset(value) => *value,
+        PageCursor::Keyset(_) => 0,
+    }
+}
+
 fn parse_fields(value: &str) -> Vec<String> {
     value
         .trim_end_matches('|')
@@ -391,7 +526,9 @@ fn clean_text_chunk(mut chunk: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_column_type, quote_display_identifier};
+    use crate::db::models::TableIdentifier;
+
+    use super::{format_column_type, parse_table_metadata, quote_display_identifier};
 
     #[test]
     fn formats_only_parameterized_types() {
@@ -407,5 +544,48 @@ mod tests {
     fn quotes_display_identifiers() {
         assert_eq!(quote_display_identifier("order"), "\"order\"");
         assert_eq!(quote_display_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn groups_index_columns_from_metadata_rows() {
+        let mut first_index = vec![
+            "INDEX".to_owned(),
+            "ix_orders".to_owned(),
+            "1".to_owned(),
+            "0".to_owned(),
+            "1".to_owned(),
+            "2".to_owned(),
+        ];
+        first_index.extend(std::iter::repeat_n("0".to_owned(), 14));
+
+        let metadata = parse_table_metadata(
+            TableIdentifier::new("dbo", "orders"),
+            vec![
+                vec![
+                    "COLUMN".to_owned(),
+                    "id".to_owned(),
+                    "int".to_owned(),
+                    "4".to_owned(),
+                    "10".to_owned(),
+                    "0".to_owned(),
+                    "0".to_owned(),
+                    "1".to_owned(),
+                ],
+                vec![
+                    "COLUMN".to_owned(),
+                    "created_at".to_owned(),
+                    "datetime".to_owned(),
+                    "8".to_owned(),
+                    "0".to_owned(),
+                    "0".to_owned(),
+                    "1".to_owned(),
+                    "2".to_owned(),
+                ],
+                first_index,
+            ],
+        )
+        .expect("column metadata is present");
+
+        assert_eq!(metadata.indexes[0].columns, ["id", "created_at"]);
     }
 }

@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::catalog::{CatalogCache, CatalogEntry, connection_key};
-use crate::db::models::TablePreview;
+use crate::db::models::{TableMetadata, TablePage};
 use crate::services;
 use crate::ui;
 use crossbeam_channel::{Receiver, Sender};
@@ -18,6 +18,7 @@ use crate::{
     config::{AppConfig, ConnectionProfile},
     db::{
         models::{DbObject, ObjectKind},
+        query::{PageRequest, TableQuery},
         sybase,
     },
     editor::{EditorCommand, VimEditor},
@@ -110,7 +111,10 @@ pub struct App {
     pub editor: Option<EditorSession>,
     pub should_quit: bool,
     pub busy_count: usize,
-    pub table_preview: Option<TablePreview>,
+    pub table_page: Option<TablePage>,
+    pub table_metadata: Option<TableMetadata>,
+    pub table_query: TableQuery,
+    pub table_loading_more: bool,
     pub table_state: TableState,
     pub horizontal_scroll: ScrollbarState,
     pub table_column_index: usize,
@@ -157,7 +161,10 @@ impl App {
             highlighted_content: None,
             content_scroll: 0,
             status: "Listo".to_owned(),
-            table_preview: None,
+            table_page: None,
+            table_metadata: None,
+            table_query: TableQuery::default(),
+            table_loading_more: false,
             table_state: TableState::default(),
             horizontal_scroll: ScrollbarState::new(0),
             table_column_index: 0,
@@ -357,34 +364,38 @@ impl App {
 
     fn handle_table_key(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            self.table_preview = None;
+            self.table_page = None;
+            self.table_metadata = None;
             self.mode = AppMode::Browser;
             return;
         }
 
-        let Some(preview) = self.table_preview.as_ref() else {
+        let Some(page) = self.table_page.as_ref() else {
             self.mode = AppMode::Browser;
             return;
         };
 
-        if preview.columns.is_empty() {
+        if page.columns.is_empty() {
             return;
         }
 
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if preview.rows.is_empty() {
+                if page.rows.is_empty() {
                     return;
                 }
 
                 let current = self.table_state.selected().unwrap_or(0);
-                let next = (current + 1).min(preview.rows.len() - 1);
+                let next = (current + 1).min(page.rows.len() - 1);
 
                 self.table_state.select(Some(next));
+                if next + 1 == page.rows.len() && page.has_more && !self.table_loading_more {
+                    self.load_next_table_page();
+                }
             }
 
             KeyCode::Char('k') | KeyCode::Up => {
-                if preview.rows.is_empty() {
+                if page.rows.is_empty() {
                     return;
                 }
 
@@ -403,7 +414,7 @@ impl App {
             }
 
             KeyCode::Char('l') | KeyCode::Right => {
-                let last_column = preview.columns.len().saturating_sub(1);
+                let last_column = page.columns.len().saturating_sub(1);
                 let next = self.table_column_index.saturating_add(1).min(last_column);
                 self.table_column_index = next;
 
@@ -417,7 +428,7 @@ impl App {
             }
 
             KeyCode::Char('g') | KeyCode::Home => {
-                if preview.rows.is_empty() {
+                if page.rows.is_empty() {
                     return;
                 }
 
@@ -425,11 +436,14 @@ impl App {
             }
 
             KeyCode::Char('G') | KeyCode::End => {
-                if preview.rows.is_empty() {
+                if page.rows.is_empty() {
                     return;
                 }
 
-                self.table_state.select(Some(preview.rows.len() - 1));
+                self.table_state.select(Some(page.rows.len() - 1));
+                if page.has_more && !self.table_loading_more {
+                    self.load_next_table_page();
+                }
             }
 
             _ => {}
@@ -909,12 +923,65 @@ impl App {
             return;
         };
         let request_id = self.begin_request(format!("Consultando {}...", object.qualified_name()));
-        self.send(WorkerRequest::PreviewTable {
+        self.table_metadata = None;
+        self.table_page = None;
+        self.table_query = TableQuery::new(PageRequest::default());
+        self.table_loading_more = false;
+        self.current_content_object = Some(object.clone());
+        self.send(WorkerRequest::LoadTableMetadata {
             request_id,
             connection_index,
             database,
             object,
-            row_limit: 100,
+            profile,
+        });
+    }
+
+    fn load_first_table_page(&mut self, object: DbObject) {
+        let Some(profile) = self.current_profile().cloned() else {
+            return;
+        };
+        let connection_index = self.connection_index;
+        let Some(database) = self.current_database().map(ToOwned::to_owned) else {
+            return;
+        };
+        let request_id = self.begin_request(format!("Consultando {}...", object.qualified_name()));
+        self.table_query = TableQuery::default();
+        self.send(WorkerRequest::QueryTable {
+            request_id,
+            connection_index,
+            database,
+            object,
+            query: self.table_query.clone(),
+            profile,
+        });
+    }
+
+    fn load_next_table_page(&mut self) {
+        let Some(page) = self.table_page.as_ref() else {
+            return;
+        };
+        let Some(cursor) = page.next_cursor.clone() else {
+            return;
+        };
+        let Some(object) = self.current_content_object.clone() else {
+            return;
+        };
+        let Some(profile) = self.current_profile().cloned() else {
+            return;
+        };
+        let Some(database) = self.current_database().map(ToOwned::to_owned) else {
+            return;
+        };
+        self.table_query.page.cursor = Some(cursor);
+        let request_id = self.begin_request("Cargando más filas...");
+        self.table_loading_more = true;
+        self.send(WorkerRequest::QueryTable {
+            request_id,
+            connection_index: self.connection_index,
+            database,
+            object,
+            query: self.table_query.clone(),
             profile,
         });
     }
@@ -1080,6 +1147,8 @@ impl App {
             | WorkerResponse::ObjectsLoaded { request_id, .. }
             | WorkerResponse::DefinitionLoaded { request_id, .. }
             | WorkerResponse::TablePreviewed { request_id, .. }
+            | WorkerResponse::TableMetadataLoaded { request_id, .. }
+            | WorkerResponse::TablePageLoaded { request_id, .. }
             | WorkerResponse::SqlExecuted { request_id, .. }
             | WorkerResponse::CatalogRefreshed { request_id, .. } => *request_id,
         };
@@ -1152,7 +1221,8 @@ impl App {
                             self.objects.len()
                         );
                         self.highlighted_content = None;
-                        self.table_preview = None;
+                        self.table_page = None;
+                        self.table_metadata = None;
 
                         self.status = format!("{} {} cargados", self.objects.len(), kind);
                         if let Some(target) = self.pending_catalog_target.take() {
@@ -1189,7 +1259,8 @@ impl App {
                         self.content_scroll = 0;
                         self.content = definition.clone();
                         self.highlighted_content = Some(ui::highlight_sql(&definition));
-                        self.table_preview = None;
+                        self.table_page = None;
+                        self.table_metadata = None;
                         self.current_content_object = Some(object.clone());
                         self.status = format!("Definición cargada: {}", object.qualified_name());
                         if requested_editor {
@@ -1214,27 +1285,127 @@ impl App {
             } => {
                 if self.connection_index != connection_index
                     || self.current_database() != Some(database.as_str())
+                    || self.current_content_object.as_ref() != Some(&object)
                 {
                     return;
                 }
                 match result {
                     Ok(output) => {
-                        self.content_title = format!("Datos · {} ", object.qualified_name());
+                        let page =
+                            match TablePage::new(output.columns, output.rows, None, false, None) {
+                                Ok(page) => page,
+                                Err(error) => {
+                                    self.set_error(error.to_string());
+                                    return;
+                                }
+                            };
+                        self.content_title = format!("Datos · {}", object.qualified_name());
                         self.content_scroll = 0;
-                        self.horizontal_scroll = ScrollbarState::new(output.columns.len());
+                        self.horizontal_scroll = ScrollbarState::new(page.columns.len());
                         self.table_state = TableState::default();
                         self.table_column_index = 0;
                         self.table_visible_columns = 0;
-                        if !output.rows.is_empty() {
+                        if !page.rows.is_empty() {
                             self.table_state.select(Some(0));
                         }
-                        self.table_preview = Some(output);
+                        self.table_page = Some(page);
+                        self.table_metadata = None;
                         self.current_content_object = Some(object);
                         self.highlighted_content = None;
                         self.mode = AppMode::Table;
                         self.status = "Tabla cargada".to_owned();
                     }
                     Err(error) => self.set_error(error),
+                }
+            }
+            WorkerResponse::TableMetadataLoaded {
+                request_id,
+                connection_index,
+                database,
+                object,
+                result,
+            } => {
+                if self.connection_index != connection_index
+                    || self.current_database() != Some(database.as_str())
+                    || self.current_content_object.as_ref() != Some(&object)
+                {
+                    return;
+                }
+
+                match result {
+                    Ok(metadata) => {
+                        let column_count = metadata.columns.len();
+                        let index_count = metadata.indexes.len();
+                        self.table_metadata = Some(metadata);
+                        self.status = format!(
+                            "Metadata cargada · {column_count} columnas · {index_count} índices"
+                        );
+                        self.load_first_table_page(object);
+                    }
+                    Err(error) => self.set_error(error),
+                }
+                self.pending_requests.remove(&request_id);
+            }
+            WorkerResponse::TablePageLoaded {
+                connection_index,
+                database,
+                object,
+                result,
+                ..
+            } => {
+                if self.connection_index != connection_index
+                    || self.current_database() != Some(database.as_str())
+                {
+                    return;
+                }
+
+                match result {
+                    Ok(page) => {
+                        let loading_more = self.table_loading_more;
+                        if loading_more {
+                            let Some(current_page) = self.table_page.as_mut() else {
+                                self.set_error(
+                                    "No hay una página base para agregar filas".to_owned(),
+                                );
+                                self.table_loading_more = false;
+                                return;
+                            };
+                            if current_page.columns != page.columns {
+                                self.set_error(
+                                    "La página recibida tiene columnas incompatibles".to_owned(),
+                                );
+                                self.table_loading_more = false;
+                                return;
+                            }
+                            current_page.rows.extend(page.rows);
+                            current_page.next_cursor = page.next_cursor;
+                            current_page.has_more = page.has_more;
+                            current_page.total_rows = page.total_rows;
+                        } else {
+                            self.horizontal_scroll = ScrollbarState::new(page.columns.len());
+                            self.table_state = TableState::default();
+                            self.table_column_index = 0;
+                            self.table_visible_columns = 0;
+                            if !page.rows.is_empty() {
+                                self.table_state.select(Some(0));
+                            }
+                            self.table_page = Some(page);
+                        }
+                        self.table_loading_more = false;
+                        self.content_title = format!("Datos · {}", object.qualified_name());
+                        self.current_content_object = Some(object.clone());
+                        self.highlighted_content = None;
+                        self.mode = AppMode::Table;
+                        self.status = if loading_more {
+                            "Más filas cargadas".to_owned()
+                        } else {
+                            "Tabla cargada".to_owned()
+                        };
+                    }
+                    Err(error) => {
+                        self.table_loading_more = false;
+                        self.set_error(error);
+                    }
                 }
             }
             WorkerResponse::SqlExecuted {
@@ -1254,7 +1425,8 @@ impl App {
                         self.content_scroll = 0;
                         self.content = output.combined();
                         self.highlighted_content = None;
-                        self.table_preview = None;
+                        self.table_page = None;
+                        self.table_metadata = None;
                         if output.success {
                             if let Some(session) = self.editor.as_mut() {
                                 session.editor.mark_clean();
@@ -1334,7 +1506,8 @@ impl App {
     fn set_error(&mut self, message: String) {
         self.status = format!("ERROR: {}", first_line(&message));
         self.highlighted_content = None;
-        self.table_preview = None;
+        self.table_page = None;
+        self.table_metadata = None;
         self.content_title = "Error".to_owned();
         self.content_scroll = 0;
         self.content = message;

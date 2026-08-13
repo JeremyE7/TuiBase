@@ -142,15 +142,16 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
     let table_area = areas[0];
     let scrollbar_area = areas[1];
 
-    let Some(preview) = app.table_preview.as_ref() else {
+    let Some(page) = app.table_page.as_ref() else {
         frame.render_widget(
-            Paragraph::new("No hay una tabla cargada").block(panel_block(" Tabla ", true)),
+            Paragraph::new("Cargando metadata y datos de la tabla...")
+                .block(panel_block(" Tabla ", true)),
             frame.area(),
         );
         return;
     };
 
-    if preview.columns.is_empty() {
+    if page.columns.is_empty() {
         frame.render_widget(
             Paragraph::new("La tabla no tiene columnas").block(panel_block(" Tabla ", true)),
             frame.area(),
@@ -160,7 +161,7 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
 
     const COLUMN_WIDTH: usize = 18;
     const COLUMN_SPACING: usize = 1;
-    let total_columns = preview.columns.len();
+    let total_columns = page.columns.len();
     let available_width = table_area.width.saturating_sub(2) as usize;
     let visible_columns = ((available_width + COLUMN_SPACING) / (COLUMN_WIDTH + COLUMN_SPACING))
         .max(1)
@@ -184,11 +185,11 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
     let header = Row::new(
         column_range
             .clone()
-            .map(|index| preview.columns[index].as_str()),
+            .map(|index| page.columns[index].as_str()),
     )
     .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows = preview.rows.iter().map(|values| {
+    let rows = page.rows.iter().map(|values| {
         Row::new(
             column_range
                 .clone()
@@ -203,7 +204,23 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         .row_highlight_style(Style::default().bg(Color::Black).fg(Color::Yellow))
         .cell_highlight_style(Style::default().bg(Color::LightYellow).fg(Color::Black))
         .block(panel_block(
-            format!(" Tabla · {} · Esc salir ", app.content_title),
+            format!(
+                " Tabla · {} · {} cols · {} índices{} · Esc salir ",
+                app.content_title,
+                app.table_metadata
+                    .as_ref()
+                    .map_or(0, |metadata| metadata.columns.len()),
+                app.table_metadata
+                    .as_ref()
+                    .map_or(0, |metadata| metadata.indexes.len()),
+                if app.table_loading_more {
+                    " · cargando"
+                } else if page.has_more {
+                    " · más filas disponibles"
+                } else {
+                    ""
+                }
+            ),
             true,
         ));
 

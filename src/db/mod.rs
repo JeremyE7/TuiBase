@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod models;
+pub mod query;
 pub mod sybase;
 
 use anyhow::{Result, bail};

@@ -8,7 +8,8 @@ use crate::{
     db::{
         backend::DatabaseBackend,
         backend_for,
-        models::{DbObject, ObjectKind, SqlOutput, TablePreview},
+        models::{DbObject, ObjectKind, SqlOutput, TableMetadata, TablePage, TablePreview},
+        query::TableQuery,
     },
 };
 
@@ -44,6 +45,21 @@ pub enum WorkerRequest {
         database: String,
         object: DbObject,
         row_limit: usize,
+        profile: ConnectionProfile,
+    },
+    LoadTableMetadata {
+        request_id: u64,
+        connection_index: usize,
+        database: String,
+        object: DbObject,
+        profile: ConnectionProfile,
+    },
+    QueryTable {
+        request_id: u64,
+        connection_index: usize,
+        database: String,
+        object: DbObject,
+        query: TableQuery,
         profile: ConnectionProfile,
     },
     ExecuteSql {
@@ -92,6 +108,20 @@ pub enum WorkerResponse {
         database: String,
         object: DbObject,
         result: Result<TablePreview, String>,
+    },
+    TableMetadataLoaded {
+        request_id: u64,
+        connection_index: usize,
+        database: String,
+        object: DbObject,
+        result: Result<TableMetadata, String>,
+    },
+    TablePageLoaded {
+        request_id: u64,
+        connection_index: usize,
+        database: String,
+        object: DbObject,
+        result: Result<TablePage, String>,
     },
     SqlExecuted {
         request_id: u64,
@@ -207,6 +237,43 @@ fn execute_request(request: WorkerRequest) -> WorkerResponse {
                 backend.preview_table(&profile, &database, &object, row_limit)
             });
             WorkerResponse::TablePreviewed {
+                request_id,
+                connection_index,
+                database,
+                object,
+                result,
+            }
+        }
+        WorkerRequest::LoadTableMetadata {
+            request_id,
+            connection_index,
+            database,
+            object,
+            profile,
+        } => {
+            let result = with_backend(&profile, |backend| {
+                backend.table_metadata(&profile, &database, &object)
+            });
+            WorkerResponse::TableMetadataLoaded {
+                request_id,
+                connection_index,
+                database,
+                object,
+                result,
+            }
+        }
+        WorkerRequest::QueryTable {
+            request_id,
+            connection_index,
+            database,
+            object,
+            query,
+            profile,
+        } => {
+            let result = with_backend(&profile, |backend| {
+                backend.query_table(&profile, &database, &object, &query)
+            });
+            WorkerResponse::TablePageLoaded {
                 request_id,
                 connection_index,
                 database,

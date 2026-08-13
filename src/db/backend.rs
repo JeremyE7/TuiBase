@@ -1,6 +1,12 @@
 use anyhow::Result;
 
-use crate::{config::ConnectionProfile, db::models::TablePreview};
+use crate::{
+    config::ConnectionProfile,
+    db::{
+        models::{TableMetadata, TablePage, TablePreview},
+        query::TableQuery,
+    },
+};
 
 use super::models::{DbObject, ObjectKind, SqlOutput};
 
@@ -26,5 +32,18 @@ pub trait DatabaseBackend: Send + Sync {
         object: &DbObject,
         row_limit: usize,
     ) -> Result<TablePreview>;
+    fn table_metadata(
+        &self,
+        profile: &ConnectionProfile,
+        database: &str,
+        object: &DbObject,
+    ) -> Result<TableMetadata>;
+    fn query_table(
+        &self,
+        profile: &ConnectionProfile,
+        database: &str,
+        object: &DbObject,
+        query: &TableQuery,
+    ) -> Result<TablePage>;
     fn execute(&self, profile: &ConnectionProfile, database: &str, sql: &str) -> Result<SqlOutput>;
 }
