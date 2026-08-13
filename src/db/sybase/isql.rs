@@ -312,13 +312,31 @@ impl DatabaseBackend for IsqlBackend {
         database: &str,
         object: &DbObject,
     ) -> Result<TableMetadata> {
-        let rows = self.structured_rows_with_empty(
-            profile,
-            database,
-            &queries::table_metadata(object),
-            true,
-        )?;
-        parse_table_metadata(queries::table_identifier(object), rows)
+        let output = self.run_sql(profile, database, &queries::table_metadata(object))?;
+        if !output.success {
+            bail!(
+                "No se pudo leer la metadata de la tabla: {}",
+                output.combined()
+            );
+        }
+
+        let rows = output
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                marker_payload(line, queries::row_marker()).map(|row| {
+                    row.trim_end_matches('|')
+                        .split('|')
+                        .map(|value| value.trim().to_owned())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        parse_table_metadata(
+            queries::table_identifier(object),
+            rows,
+            parse_sp_helpindex(&output.stdout),
+        )
     }
 
     fn query_table(
@@ -342,7 +360,7 @@ impl DatabaseBackend for IsqlBackend {
         let columns = metadata
             .columns
             .iter()
-            .map(|column| column.name.clone())
+            .map(|column| (column.name.clone(), column.data_type.clone()))
             .collect::<Vec<_>>();
         let output = self.run_sql(
             profile,
@@ -434,17 +452,13 @@ fn parse_optional_u32(value: &str) -> Option<u32> {
 fn parse_table_metadata(
     identifier: crate::db::models::TableIdentifier,
     rows: Vec<Vec<String>>,
+    indexes: Vec<IndexMetadata>,
 ) -> Result<TableMetadata> {
     let mut columns = Vec::new();
-    let mut index_rows = Vec::new();
 
     for row in rows {
-        let Some(kind) = row.first().map(String::as_str) else {
-            continue;
-        };
-
-        match kind {
-            "COLUMN" if row.len() >= 8 => columns.push(ColumnMetadata {
+        if row.len() >= 8 && row[0] == "COLUMN" {
+            columns.push(ColumnMetadata {
                 name: row[1].clone(),
                 data_type: row[2].clone(),
                 length: parse_optional_u32(&row[3]),
@@ -452,9 +466,7 @@ fn parse_table_metadata(
                 scale: parse_optional_u32(&row[5]),
                 nullable: row[6] == "1",
                 ordinal_position: row[7].parse().unwrap_or(columns.len() + 1),
-            }),
-            "INDEX" if row.len() >= 20 => index_rows.push(row),
-            _ => {}
+            });
         }
     }
 
@@ -462,33 +474,45 @@ fn parse_table_metadata(
         bail!("La tabla no contiene columnas");
     }
 
-    let indexes = index_rows
-        .into_iter()
-        .map(|row| {
-            let columns = row
-                .iter()
-                .skip(4)
-                .take(16)
-                .filter_map(|value| value.parse::<usize>().ok())
-                .filter(|ordinal| *ordinal > 0)
-                .filter_map(|ordinal| {
-                    columns
-                        .iter()
-                        .find(|column| column.ordinal_position == ordinal)
-                        .map(|column| column.name.clone())
-                })
-                .collect();
-
-            IndexMetadata {
-                name: row[1].clone(),
-                columns,
-                is_unique: row[2] == "1",
-                is_primary: row[3] == "1",
-            }
-        })
-        .collect();
-
     Ok(TableMetadata::new(identifier, columns, indexes))
+}
+
+fn parse_sp_helpindex(output: &str) -> Vec<IndexMetadata> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields = line
+                .split('|')
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>();
+            if fields.len() < 3
+                || fields[0] == "Object has the following indexes"
+                || fields[0] == "index_name"
+                || fields[0].starts_with('(')
+                || fields[0].starts_with("return status")
+            {
+                return None;
+            }
+
+            let description = fields.get(2)?.to_ascii_lowercase();
+            if !description.contains("clustered") && !description.contains("nonclustered") {
+                return None;
+            }
+
+            Some(IndexMetadata {
+                name: fields[0].to_owned(),
+                columns: fields[1]
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|column| !column.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                is_unique: description.contains("unique"),
+                is_primary: false,
+            })
+        })
+        .collect()
 }
 
 fn cursor_offset(cursor: &PageCursor) -> u64 {
@@ -526,9 +550,11 @@ fn clean_text_chunk(mut chunk: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::db::models::TableIdentifier;
+    use crate::db::models::{IndexMetadata, TableIdentifier};
 
-    use super::{format_column_type, parse_table_metadata, quote_display_identifier};
+    use super::{
+        format_column_type, parse_sp_helpindex, parse_table_metadata, quote_display_identifier,
+    };
 
     #[test]
     fn formats_only_parameterized_types() {
@@ -548,16 +574,6 @@ mod tests {
 
     #[test]
     fn groups_index_columns_from_metadata_rows() {
-        let mut first_index = vec![
-            "INDEX".to_owned(),
-            "ix_orders".to_owned(),
-            "1".to_owned(),
-            "0".to_owned(),
-            "1".to_owned(),
-            "2".to_owned(),
-        ];
-        first_index.extend(std::iter::repeat_n("0".to_owned(), 14));
-
         let metadata = parse_table_metadata(
             TableIdentifier::new("dbo", "orders"),
             vec![
@@ -581,11 +597,65 @@ mod tests {
                     "1".to_owned(),
                     "2".to_owned(),
                 ],
-                first_index,
             ],
+            vec![IndexMetadata {
+                name: "ix_orders".to_owned(),
+                columns: vec!["id".to_owned(), "created_at".to_owned()],
+                is_unique: true,
+                is_primary: false,
+            }],
         )
         .expect("column metadata is present");
 
         assert_eq!(metadata.indexes[0].columns, ["id", "created_at"]);
+    }
+
+    #[test]
+    fn ignores_empty_index_columns() {
+        let metadata = parse_table_metadata(
+            TableIdentifier::new("dbo", "orders"),
+            vec![vec![
+                "COLUMN".to_owned(),
+                "id".to_owned(),
+                "int".to_owned(),
+                "4".to_owned(),
+                "10".to_owned(),
+                "0".to_owned(),
+                "0".to_owned(),
+                "1".to_owned(),
+            ]],
+            vec![IndexMetadata {
+                name: "ix_orders".to_owned(),
+                columns: vec!["id".to_owned()],
+                is_unique: false,
+                is_primary: false,
+            }],
+        )
+        .expect("column metadata is present");
+
+        assert_eq!(metadata.indexes[0].columns, ["id"]);
+    }
+
+    #[test]
+    fn parses_sp_helpindex_rows() {
+        let output = "Object has the following indexes\n|ncsysobjects| name, uid, schemaid|nonclustered, unique| 0|\n|csysobjects| id|clustered, unique| 0|\n(2 rows affected)\n";
+
+        assert_eq!(
+            parse_sp_helpindex(output),
+            vec![
+                IndexMetadata {
+                    name: "ncsysobjects".to_owned(),
+                    columns: vec!["name".to_owned(), "uid".to_owned(), "schemaid".to_owned()],
+                    is_unique: true,
+                    is_primary: false,
+                },
+                IndexMetadata {
+                    name: "csysobjects".to_owned(),
+                    columns: vec!["id".to_owned()],
+                    is_unique: true,
+                    is_primary: false,
+                },
+            ]
+        );
     }
 }

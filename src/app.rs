@@ -119,6 +119,7 @@ pub struct App {
     pub horizontal_scroll: ScrollbarState,
     pub table_column_index: usize,
     pub table_visible_columns: usize,
+    pub table_show_metadata: bool,
     search: Option<SearchSession>,
     active_search: Option<String>,
     catalog: CatalogCache,
@@ -169,6 +170,7 @@ impl App {
             horizontal_scroll: ScrollbarState::new(0),
             table_column_index: 0,
             table_visible_columns: 0,
+            table_show_metadata: false,
             last_key: String::new(),
             editor: None,
             should_quit: false,
@@ -366,7 +368,29 @@ impl App {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.table_page = None;
             self.table_metadata = None;
+            self.table_show_metadata = false;
             self.mode = AppMode::Browser;
+            return;
+        }
+
+        if key.code == KeyCode::Char('i') {
+            self.table_show_metadata = !self.table_show_metadata;
+            self.content_scroll = 0;
+            return;
+        }
+
+        if self.table_show_metadata {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.content_scroll = self.content_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.content_scroll = self.content_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('g') | KeyCode::Home => self.content_scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => self.content_scroll = u16::MAX,
+                _ => {}
+            }
             return;
         }
 
@@ -1261,6 +1285,7 @@ impl App {
                         self.highlighted_content = Some(ui::highlight_sql(&definition));
                         self.table_page = None;
                         self.table_metadata = None;
+                        self.table_show_metadata = false;
                         self.current_content_object = Some(object.clone());
                         self.status = format!("Definición cargada: {}", object.qualified_name());
                         if requested_editor {
@@ -1310,6 +1335,7 @@ impl App {
                         }
                         self.table_page = Some(page);
                         self.table_metadata = None;
+                        self.table_show_metadata = false;
                         self.current_content_object = Some(object);
                         self.highlighted_content = None;
                         self.mode = AppMode::Table;
@@ -1391,6 +1417,7 @@ impl App {
                             }
                             self.table_page = Some(page);
                         }
+                        self.table_show_metadata = false;
                         self.table_loading_more = false;
                         self.content_title = format!("Datos · {}", object.qualified_name());
                         self.current_content_object = Some(object.clone());
@@ -1427,6 +1454,7 @@ impl App {
                         self.highlighted_content = None;
                         self.table_page = None;
                         self.table_metadata = None;
+                        self.table_show_metadata = false;
                         if output.success {
                             if let Some(session) = self.editor.as_mut() {
                                 session.editor.mark_clean();
@@ -1508,6 +1536,7 @@ impl App {
         self.highlighted_content = None;
         self.table_page = None;
         self.table_metadata = None;
+        self.table_show_metadata = false;
         self.content_title = "Error".to_owned();
         self.content_scroll = 0;
         self.content = message;

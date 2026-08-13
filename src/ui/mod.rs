@@ -142,6 +142,12 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
     let table_area = areas[0];
     let scrollbar_area = areas[1];
 
+    if app.table_show_metadata {
+        render_table_metadata(frame, table_area, app);
+        render_status(frame, areas[1], app);
+        return;
+    }
+
     let Some(page) = app.table_page.as_ref() else {
         frame.render_widget(
             Paragraph::new("Cargando metadata y datos de la tabla...")
@@ -240,6 +246,94 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         }),
         &mut app.horizontal_scroll,
     );
+}
+
+fn render_table_metadata(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(metadata) = app.table_metadata.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("La metadata todavía no está disponible")
+                .block(panel_block(" Metadata · i volver ", true)),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = Vec::with_capacity(metadata.columns.len() + metadata.indexes.len() + 6);
+    lines.push(Line::from("COLUMNAS"));
+    lines.push(Line::from(
+        "#   Nombre                         Tipo                 Null",
+    ));
+    lines.push(Line::from(
+        "────────────────────────────────────────────────────────────",
+    ));
+    for column in &metadata.columns {
+        lines.push(Line::from(format!(
+            "{:<3} {:<30} {:<20} {}",
+            column.ordinal_position,
+            column.name,
+            format_column_type(column),
+            if column.nullable { "NULL" } else { "NOT NULL" }
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("ÍNDICES"));
+    if metadata.indexes.is_empty() {
+        lines.push(Line::from("  (ninguno)"));
+    } else {
+        for index in &metadata.indexes {
+            let mut flags = Vec::new();
+            if index.is_unique {
+                flags.push("unique");
+            }
+            if index.is_primary {
+                flags.push("primary");
+            }
+            let suffix = if flags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", flags.join(", "))
+            };
+            lines.push(Line::from(format!(
+                "  {}{} — {}",
+                index.name,
+                suffix,
+                if index.columns.is_empty() {
+                    "(columnas no informadas)".to_owned()
+                } else {
+                    index.columns.join(", ")
+                }
+            )));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(panel_block(
+                format!(" Metadata · {} · i volver ", app.content_title),
+                true,
+            ))
+            .scroll((app.content_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn format_column_type(column: &crate::db::models::ColumnMetadata) -> String {
+    match column.data_type.to_ascii_lowercase().as_str() {
+        "char" | "varchar" | "nchar" | "nvarchar" | "binary" | "varbinary" | "unichar"
+        | "univarchar" => column.length.map_or_else(
+            || column.data_type.clone(),
+            |length| format!("{}({length})", column.data_type),
+        ),
+        "numeric" | "decimal" => match (column.precision, column.scale) {
+            (Some(precision), Some(scale)) => {
+                format!("{}({precision},{scale})", column.data_type)
+            }
+            _ => column.data_type.clone(),
+        },
+        _ => column.data_type.clone(),
+    }
 }
 
 fn render_editor(frame: &mut Frame<'_>, app: &App) {
@@ -417,6 +511,9 @@ fn render_help(frame: &mut Frame<'_>) {
         "  R             recargar conexiones c          probar conexión",
         "  Enter         tabla/detalle       e          editar SP/función/vista",
         "  E             editar datos T-SQL  :          consulta T-SQL",
+        "\nTABLA",
+        "  i             metadata de columnas e índices",
+        "  j/k           desplazarse en metadata     Esc/q salir",
         "  ?             ayuda               q          salir",
         "",
         "EDITOR NVIM-LIKE",

@@ -174,36 +174,11 @@ pub fn table_metadata(object: &DbObject) -> String {
            and o.name = '{name}'\n\
            and user_name(o.uid) = '{owner}'\n\
          order by c.colid\n\
-         select '{ROW_MARKER}INDEX|'\n\
-              + rtrim(i.name) + '|'\n\
-              + case when (i.status & 2) = 2 then '1' else '0' end + '|'\n\
-              + case when (i.status & 2048) = 2048 then '1' else '0' end + '|'\n\
-              + convert(varchar(10), isnull(i.key1, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key2, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key3, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key4, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key5, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key6, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key7, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key8, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key9, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key10, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key11, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key12, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key13, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key14, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key15, 0)) + '|'\n\
-              + convert(varchar(10), isnull(i.key16, 0))\n\
-         from sysindexes i, sysobjects o\n\
-         where i.id = o.id\n\
-           and o.name = '{name}'\n\
-           and user_name(o.uid) = '{owner}'\n\
-           and i.name is not null\n\
-         order by i.name\n"
+         exec sp_helpindex '{owner}.{name}'\n"
     );
 }
 
-pub fn query_table(object: &DbObject, query: &TableQuery, columns: &[String]) -> String {
+pub fn query_table(object: &DbObject, query: &TableQuery, columns: &[(String, String)]) -> String {
     let table = qualified_identifier(&object.owner, &object.name);
     let where_clause = query
         .filters
@@ -260,7 +235,13 @@ pub fn query_table(object: &DbObject, query: &TableQuery, columns: &[String]) ->
          from {table}{where_clause}{order_clause}\n\
          set rowcount 0\n",
         fetch_limit = fetch_limit,
-        header = string_literal(&columns.join("|")),
+        header = string_literal(
+            &columns
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join("|"),
+        ),
         projection = row_expression(columns),
         table = table,
         where_clause = where_clause,
@@ -268,14 +249,20 @@ pub fn query_table(object: &DbObject, query: &TableQuery, columns: &[String]) ->
     );
 }
 
-fn row_expression(columns: &[String]) -> String {
+fn row_expression(columns: &[(String, String)]) -> String {
     columns
         .iter()
-        .map(|column| {
-            format!(
-                "isnull(convert(varchar(255), {}), '<NULL>')",
-                quote_identifier(column)
-            )
+        .map(|(column, data_type)| {
+            let identifier = quote_identifier(column);
+            match data_type.to_ascii_lowercase().as_str() {
+                "image" => {
+                    format!("case when {identifier} is null then '<NULL>' else '<IMAGE>' end")
+                }
+                "text" | "unitext" => {
+                    format!("case when {identifier} is null then '<NULL>' else '<TEXT>' end")
+                }
+                _ => format!("isnull(convert(varchar(255), {identifier}), '<NULL>')"),
+            }
         })
         .collect::<Vec<_>>()
         .join(" + '|' + ")
@@ -355,7 +342,14 @@ mod tests {
             Some("active'"),
         ));
 
-        let sql = query_table(&object, &query, &["id".to_owned(), "status".to_owned()]);
+        let sql = query_table(
+            &object,
+            &query,
+            &[
+                ("id".to_owned(), "int".to_owned()),
+                ("status".to_owned(), "varchar".to_owned()),
+            ],
+        );
 
         assert!(sql.contains("order by \"created_at\" desc"));
         assert!(sql.contains("like '%active''%"));
@@ -363,6 +357,31 @@ mod tests {
         assert!(sql.contains("set quoted_identifier on"));
         assert!(sql.contains("set rowcount 11"));
         assert!(!sql.contains("active'%'"));
+    }
+
+    #[test]
+    fn renders_lob_columns_without_implicit_varchar_conversion() {
+        let object = DbObject {
+            owner: "dbo".to_owned(),
+            name: "documents".to_owned(),
+            kind: ObjectKind::Table,
+        };
+        let query = TableQuery::default();
+
+        let sql = query_table(
+            &object,
+            &query,
+            &[
+                ("id".to_owned(), "int".to_owned()),
+                ("payload".to_owned(), "image".to_owned()),
+                ("notes".to_owned(), "text".to_owned()),
+            ],
+        );
+
+        assert!(sql.contains("'<IMAGE>'"));
+        assert!(sql.contains("'<TEXT>'"));
+        assert!(!sql.contains("convert(varchar(255), \"payload\")"));
+        assert!(!sql.contains("convert(varchar(255), \"notes\")"));
     }
 
     #[test]
@@ -377,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn uses_ase_index_keys_instead_of_sql_server_catalogs() {
+    fn delegates_index_metadata_to_ase_native_procedure() {
         let object = DbObject {
             owner: "dbo".to_owned(),
             name: "orders".to_owned(),
@@ -386,8 +405,8 @@ mod tests {
 
         let sql = table_metadata(&object);
 
-        assert!(sql.contains("i.key1"));
-        assert!(sql.contains("i.key16"));
-        assert!(!sql.contains("sysindexkeys"));
+        assert!(sql.contains("exec sp_helpindex 'dbo.orders'"));
+        assert!(!sql.contains("index_col"));
+        assert!(!sql.contains("sysindexes"));
     }
 }
