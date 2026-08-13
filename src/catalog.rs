@@ -62,6 +62,13 @@ pub struct CatalogEntry {
     pub kind: CatalogEntryKind,
 }
 
+#[derive(Debug, Clone)]
+pub struct SearchCatalogEntry {
+    pub entry: CatalogEntry,
+    pub search_text: crate::search::PreparedText,
+    pub path: crate::search::PreparedText,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogEntryKind {
     Database,
@@ -166,6 +173,17 @@ impl CatalogCache {
                         }
                     }))
                 })
+            })
+            .collect()
+    }
+
+    pub fn search_entries(&self) -> Vec<SearchCatalogEntry> {
+        self.entries()
+            .into_iter()
+            .map(|entry| SearchCatalogEntry {
+                search_text: crate::search::prepare_text(&entry.search_text()),
+                path: crate::search::prepare_text(&entry.path()),
+                entry,
             })
             .collect()
     }

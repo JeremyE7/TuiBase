@@ -279,9 +279,11 @@ fn filter_sql(column: &str, operator: FilterOperator, value: Option<&str>) -> St
         FilterOperator::GreaterThanOrEqual => comparison_sql(&identifier, ">=", value),
         FilterOperator::LessThan => comparison_sql(&identifier, "<", value),
         FilterOperator::LessThanOrEqual => comparison_sql(&identifier, "<=", value),
-        FilterOperator::Contains => like_sql(&identifier, "%", "%", value),
-        FilterOperator::StartsWith => like_sql(&identifier, "", "%", value),
-        FilterOperator::EndsWith => like_sql(&identifier, "%", "", value),
+        FilterOperator::Like => like_sql(&identifier, "like", value),
+        FilterOperator::NotLike => like_sql(&identifier, "not like", value),
+        FilterOperator::Contains => like_pattern_sql(&identifier, "like", "%", "%", value),
+        FilterOperator::StartsWith => like_pattern_sql(&identifier, "like", "", "%", value),
+        FilterOperator::EndsWith => like_pattern_sql(&identifier, "like", "%", "", value),
     }
 }
 
@@ -292,13 +294,39 @@ fn comparison_sql(identifier: &str, operator: &str, value: Option<&str>) -> Stri
     )
 }
 
-fn like_sql(identifier: &str, prefix: &str, suffix: &str, value: Option<&str>) -> String {
+fn like_sql(identifier: &str, operator: &str, value: Option<&str>) -> String {
     format!(
-        "convert(varchar(255), {identifier}) like '{}{}{}'",
+        "convert(varchar(255), {identifier}) {operator} '{}' escape '\\'",
+        escape_like_expression(value.unwrap_or_default())
+    )
+}
+
+fn like_pattern_sql(
+    identifier: &str,
+    operator: &str,
+    prefix: &str,
+    suffix: &str,
+    value: Option<&str>,
+) -> String {
+    format!(
+        "convert(varchar(255), {identifier}) {operator} '{}{}{}' escape '\\'",
         prefix,
-        string_literal(value.unwrap_or_default()),
+        escape_like_pattern(value.unwrap_or_default()),
         suffix
     )
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    string_literal(
+        &value
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_"),
+    )
+}
+
+fn escape_like_expression(value: &str) -> String {
+    string_literal(&value.replace('\\', "\\\\"))
 }
 
 pub fn table_identifier(object: &DbObject) -> TableIdentifier {
@@ -357,6 +385,33 @@ mod tests {
         assert!(sql.contains("set quoted_identifier on"));
         assert!(sql.contains("set rowcount 11"));
         assert!(!sql.contains("active'%'"));
+    }
+
+    #[test]
+    fn escapes_literal_like_wildcards_but_preserves_explicit_like_patterns() {
+        let object = DbObject {
+            owner: "dbo".to_owned(),
+            name: "orders".to_owned(),
+            kind: ObjectKind::Table,
+        };
+        let mut query = TableQuery::default();
+        query.filters.push(FilterSpec::new(
+            "name",
+            FilterOperator::Contains,
+            Some("50%_off"),
+        ));
+        query
+            .filters
+            .push(FilterSpec::new("code", FilterOperator::Like, Some("A%")));
+
+        let sql = query_table(
+            &object,
+            &query,
+            &[("name".to_owned(), "varchar".to_owned())],
+        );
+
+        assert!(sql.contains("like '%50\\%\\_off%' escape '\\'"));
+        assert!(sql.contains("like 'A%' escape '\\'"));
     }
 
     #[test]

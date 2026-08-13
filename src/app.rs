@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::catalog::{CatalogCache, CatalogEntry, connection_key};
+use crate::catalog::{CatalogCache, CatalogEntry, SearchCatalogEntry, connection_key};
 use crate::db::models::{TableMetadata, TablePage};
 use crate::services;
 use crate::ui;
@@ -18,7 +18,7 @@ use crate::{
     config::{AppConfig, ConnectionProfile},
     db::{
         models::{DbObject, ObjectKind},
-        query::{PageRequest, TableQuery},
+        query::{FilterOperator, FilterSpec, PageRequest, TableQuery, parse_filter_expression},
         sybase,
     },
     editor::{EditorCommand, VimEditor},
@@ -36,6 +36,21 @@ pub enum AppMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableCopySource {
+    LoadedData,
+    CurrentCell,
+    CurrentRow,
+    CurrentColumn,
+    VisualSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableCopyStage {
+    Menu,
+    HeaderChoice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Connections,
     Databases,
@@ -48,6 +63,22 @@ pub struct SearchSession {
     pub input: TextArea<'static>,
     pub suggestions: Vec<CatalogEntry>,
     pub selected_suggestion: usize,
+    refresh_deadline: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilterSuggestion {
+    pub label: String,
+    insertion: String,
+    replace_start: usize,
+}
+
+pub struct FilterSession {
+    pub input: TextArea<'static>,
+    pub suggestions: Vec<FilterSuggestion>,
+    pub selected_suggestion: usize,
+    pub parse_error: Option<String>,
+    pub preview: Vec<String>,
 }
 
 impl Focus {
@@ -114,15 +145,22 @@ pub struct App {
     pub table_page: Option<TablePage>,
     pub table_metadata: Option<TableMetadata>,
     pub table_query: TableQuery,
+    pub table_filter_expression: String,
     pub table_loading_more: bool,
     pub table_state: TableState,
     pub horizontal_scroll: ScrollbarState,
     pub table_column_index: usize,
     pub table_visible_columns: usize,
     pub table_show_metadata: bool,
+    pub table_visual_anchor: Option<(usize, usize)>,
+    pub table_copy_stage: Option<TableCopyStage>,
+    pub table_copy_source: Option<TableCopySource>,
+    pub table_copy_menu_index: usize,
     search: Option<SearchSession>,
+    filter_session: Option<FilterSession>,
     active_search: Option<String>,
     catalog: CatalogCache,
+    search_index: Vec<SearchCatalogEntry>,
     catalog_refresh_pending: HashSet<usize>,
     pending_catalog_target: Option<CatalogEntry>,
     last_catalog_refresh_check: Instant,
@@ -145,6 +183,7 @@ impl App {
         response_rx: Receiver<WorkerResponse>,
     ) -> Self {
         let catalog = CatalogCache::load().unwrap_or_default();
+        let search_index = catalog.search_entries();
 
         Self {
             config,
@@ -165,12 +204,18 @@ impl App {
             table_page: None,
             table_metadata: None,
             table_query: TableQuery::default(),
+            table_filter_expression: String::new(),
             table_loading_more: false,
             table_state: TableState::default(),
             horizontal_scroll: ScrollbarState::new(0),
             table_column_index: 0,
             table_visible_columns: 0,
             table_show_metadata: false,
+            table_visual_anchor: None,
+            table_copy_stage: None,
+            table_copy_source: None,
+            table_copy_menu_index: 0,
+            filter_session: None,
             last_key: String::new(),
             editor: None,
             should_quit: false,
@@ -187,6 +232,7 @@ impl App {
             search: None,
             active_search: None,
             catalog,
+            search_index,
             catalog_refresh_pending: HashSet::new(),
             pending_catalog_target: None,
             last_catalog_refresh_check: Instant::now(),
@@ -209,6 +255,14 @@ impl App {
 
     pub fn current_search_session(&self) -> Option<&SearchSession> {
         self.search.as_ref()
+    }
+
+    pub fn current_filter_session(&self) -> Option<&FilterSession> {
+        self.filter_session.as_ref()
+    }
+
+    pub fn active_table_filter(&self) -> Option<&str> {
+        (!self.table_filter_expression.is_empty()).then_some(&self.table_filter_expression)
     }
 
     pub fn active_database(&self) -> Option<&str> {
@@ -241,6 +295,7 @@ impl App {
             self.handle_worker_response(response);
         }
         self.maybe_refresh_catalog(false);
+        self.flush_search_refresh_if_due();
         self.busy_count = self.pending_requests.len();
     }
 
@@ -327,6 +382,7 @@ impl App {
             input: TextArea::default(),
             suggestions: Vec::new(),
             selected_suggestion: 0,
+            refresh_deadline: None,
         });
 
         self.mode = AppMode::Search;
@@ -365,7 +421,22 @@ impl App {
     }
 
     fn handle_table_key(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        if key.code == KeyCode::Esc {
+            if self.filter_session.is_some() {
+                self.filter_session = None;
+                self.status = "Editor de filtros cancelado".to_owned();
+                return;
+            }
+            if self.table_copy_stage.is_some() {
+                self.table_copy_stage = None;
+                self.table_copy_source = None;
+                self.status = "Menú de copia cancelado".to_owned();
+                return;
+            }
+            if self.table_visual_anchor.take().is_some() {
+                self.status = "Selección visual cancelada".to_owned();
+                return;
+            }
             self.table_page = None;
             self.table_metadata = None;
             self.table_show_metadata = false;
@@ -373,13 +444,48 @@ impl App {
             return;
         }
 
+        if self.filter_session.is_some() {
+            self.handle_table_filter_key(key);
+            return;
+        }
+
+        if key.code == KeyCode::Char('q') {
+            self.table_page = None;
+            self.table_metadata = None;
+            self.table_show_metadata = false;
+            self.table_visual_anchor = None;
+            self.table_copy_stage = None;
+            self.table_copy_source = None;
+            self.mode = AppMode::Browser;
+            return;
+        }
+
+        if key.code == KeyCode::Char('f') {
+            if self.table_metadata.is_none() {
+                self.status = "La metadata de columnas todavía no está disponible".to_owned();
+                return;
+            }
+            self.open_table_filter();
+            return;
+        }
+
+        if key.code == KeyCode::Char('F') {
+            self.clear_table_filter();
+            return;
+        }
+
         if key.code == KeyCode::Char('i') {
             self.table_show_metadata = !self.table_show_metadata;
             self.content_scroll = 0;
+            self.table_visual_anchor = None;
             return;
         }
 
         if self.table_show_metadata {
+            if key.code == KeyCode::Char('y') {
+                self.copy_table_metadata();
+                return;
+            }
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.content_scroll = self.content_scroll.saturating_add(1);
@@ -394,32 +500,70 @@ impl App {
             return;
         }
 
-        let Some(page) = self.table_page.as_ref() else {
+        if self.table_copy_stage.is_some() {
+            self.handle_table_copy_key(key);
+            return;
+        }
+
+        let Some((row_count, column_count, has_more)) = self
+            .table_page
+            .as_ref()
+            .map(|page| (page.rows.len(), page.columns.len(), page.has_more))
+        else {
             self.mode = AppMode::Browser;
             return;
         };
 
-        if page.columns.is_empty() {
+        if column_count == 0 {
             return;
         }
 
+        if key.code == KeyCode::Char('v') {
+            if self.table_visual_anchor.take().is_some() {
+                self.status = "Selección visual desactivada".to_owned();
+            } else {
+                let row = self.table_state.selected().unwrap_or(0);
+                self.table_visual_anchor = Some((row, self.table_column_index));
+                self.status =
+                    "Selección visual activa · mueve el cursor · y copia · Esc cancela".to_owned();
+            }
+            return;
+        }
+
+        if key.code == KeyCode::Char('Y') {
+            self.open_table_copy_menu();
+            return;
+        }
+
+        if key.code == KeyCode::Char('y') {
+            if self.table_visual_anchor.is_some() {
+                self.open_table_header_choice(TableCopySource::VisualSelection);
+            } else {
+                self.copy_table_source(TableCopySource::CurrentCell, false);
+            }
+            return;
+        }
+
+        let visual = self.table_visual_anchor.is_some();
+
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if page.rows.is_empty() {
+                if row_count == 0 {
                     return;
                 }
 
                 let current = self.table_state.selected().unwrap_or(0);
-                let next = (current + 1).min(page.rows.len() - 1);
+                let next = (current + 1).min(row_count - 1);
 
                 self.table_state.select(Some(next));
-                if next + 1 == page.rows.len() && page.has_more && !self.table_loading_more {
+                self.update_visual_status(visual);
+                if next + 1 == row_count && has_more && !self.table_loading_more {
                     self.load_next_table_page();
                 }
             }
 
             KeyCode::Char('k') | KeyCode::Up => {
-                if page.rows.is_empty() {
+                if row_count == 0 {
                     return;
                 }
 
@@ -427,6 +571,7 @@ impl App {
                 let previous = current.saturating_sub(1);
 
                 self.table_state.select(Some(previous));
+                self.update_visual_status(visual);
             }
             KeyCode::Char('h') | KeyCode::Left => {
                 let previous = self.table_column_index.saturating_sub(1);
@@ -435,10 +580,11 @@ impl App {
                 if previous < self.horizontal_scroll.get_position() {
                     self.horizontal_scroll.prev();
                 }
+                self.update_visual_status(visual);
             }
 
             KeyCode::Char('l') | KeyCode::Right => {
-                let last_column = page.columns.len().saturating_sub(1);
+                let last_column = column_count.saturating_sub(1);
                 let next = self.table_column_index.saturating_add(1).min(last_column);
                 self.table_column_index = next;
 
@@ -449,53 +595,364 @@ impl App {
                 if next >= viewport_end {
                     self.horizontal_scroll.next();
                 }
+                self.update_visual_status(visual);
             }
 
             KeyCode::Char('g') | KeyCode::Home => {
-                if page.rows.is_empty() {
+                if row_count == 0 {
                     return;
                 }
 
                 self.table_state.select(Some(0));
+                self.update_visual_status(visual);
             }
 
             KeyCode::Char('G') | KeyCode::End => {
-                if page.rows.is_empty() {
+                if row_count == 0 {
                     return;
                 }
 
-                self.table_state.select(Some(page.rows.len() - 1));
-                if page.has_more && !self.table_loading_more {
+                self.table_state.select(Some(row_count - 1));
+                if has_more && !self.table_loading_more {
                     self.load_next_table_page();
                 }
+                self.update_visual_status(visual);
             }
 
             _ => {}
         }
     }
+
+    fn update_visual_status(&mut self, visual: bool) {
+        if visual {
+            self.status = "Selección visual activa · y copia · Esc cancela".to_owned();
+        }
+    }
+
+    fn open_table_filter(&mut self) {
+        let expression = self.table_filter_expression.clone();
+        self.filter_session = Some(FilterSession {
+            input: search_input(&expression),
+            suggestions: Vec::new(),
+            selected_suggestion: 0,
+            parse_error: None,
+            preview: Vec::new(),
+        });
+        self.mode = AppMode::Table;
+        self.refresh_table_filter_suggestions();
+        self.status = "Escribe el filtro · Tab completa · Enter aplica · Esc cancela".to_owned();
+    }
+
+    fn handle_table_filter_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Tab {
+            self.accept_table_filter_suggestion();
+            return;
+        }
+        if key.code == KeyCode::Up {
+            self.move_table_filter_suggestion(-1);
+            return;
+        }
+        if key.code == KeyCode::Down {
+            self.move_table_filter_suggestion(1);
+            return;
+        }
+        if key.code == KeyCode::Enter {
+            self.apply_table_filter();
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+            if let Some(session) = self.filter_session.as_mut() {
+                session.input = TextArea::default();
+            }
+            self.refresh_table_filter_suggestions();
+            return;
+        }
+
+        if let Some(session) = self.filter_session.as_mut() {
+            let input: Input = key.into();
+            session.input.input_without_shortcuts(input);
+        }
+        self.refresh_table_filter_suggestions();
+    }
+
+    fn move_table_filter_suggestion(&mut self, delta: isize) {
+        let Some(session) = self.filter_session.as_mut() else {
+            return;
+        };
+        session.selected_suggestion = shifted_index(
+            session.selected_suggestion,
+            session.suggestions.len(),
+            delta,
+        );
+    }
+
+    fn accept_table_filter_suggestion(&mut self) {
+        let Some(suggestion) = self
+            .filter_session
+            .as_ref()
+            .and_then(|session| session.suggestions.get(session.selected_suggestion))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(session) = self.filter_session.as_mut() else {
+            return;
+        };
+        let current = session.input.lines().join("\n");
+        let prefix = current.get(..suggestion.replace_start).unwrap_or("");
+        let updated = format!("{}{value}", prefix, value = suggestion.insertion);
+        session.input = search_input(&updated);
+        session.input.move_cursor(CursorMove::End);
+        self.refresh_table_filter_suggestions();
+    }
+
+    fn refresh_table_filter_suggestions(&mut self) {
+        let Some(expression) = self
+            .filter_session
+            .as_ref()
+            .map(|session| session.input.lines().join("\n"))
+        else {
+            return;
+        };
+        let columns = self.table_columns();
+        let suggestions = table_filter_suggestions(&expression, &columns);
+        let preview = parse_filter_expression(&expression, &columns)
+            .map(|filters| filters.iter().map(format_filter_spec).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let parse_error = if expression.trim().is_empty() {
+            None
+        } else {
+            parse_filter_expression(&expression, &columns)
+                .err()
+                .map(|error| error.to_string())
+        };
+
+        if let Some(session) = self.filter_session.as_mut() {
+            session.suggestions = suggestions;
+            session.selected_suggestion = session
+                .selected_suggestion
+                .min(session.suggestions.len().saturating_sub(1));
+            session.parse_error = parse_error;
+            session.preview = preview;
+        }
+    }
+
+    fn apply_table_filter(&mut self) {
+        let Some(session) = self.filter_session.as_ref() else {
+            return;
+        };
+        let expression = session.input.lines().join("\n").trim().to_owned();
+        if expression.is_empty() {
+            self.filter_session = None;
+            self.clear_table_filter();
+            return;
+        }
+        let columns = self.table_columns();
+        let filters = match parse_filter_expression(&expression, &columns) {
+            Ok(filters) => filters,
+            Err(error) => {
+                self.status = format!("Filtro inválido: {error}");
+                return;
+            }
+        };
+
+        self.table_filter_expression = expression;
+        self.table_query.filters = filters;
+        self.table_query.page.cursor = None;
+        self.filter_session = None;
+        self.table_page = None;
+        self.table_state = TableState::default();
+        self.table_column_index = 0;
+        self.horizontal_scroll = ScrollbarState::new(0);
+        self.table_loading_more = false;
+        self.load_table_query_page("Aplicando filtro...");
+    }
+
+    fn clear_table_filter(&mut self) {
+        if self.table_query.filters.is_empty() && self.table_filter_expression.is_empty() {
+            self.status = "No hay filtros activos".to_owned();
+            return;
+        }
+        self.table_query.filters.clear();
+        self.table_filter_expression.clear();
+        self.table_query.page.cursor = None;
+        self.filter_session = None;
+        self.table_page = None;
+        self.table_state = TableState::default();
+        self.table_column_index = 0;
+        self.horizontal_scroll = ScrollbarState::new(0);
+        self.table_loading_more = false;
+        self.load_table_query_page("Limpiando filtros...");
+    }
+
+    fn table_columns(&self) -> Vec<String> {
+        self.table_metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect()
+            })
+            .or_else(|| self.table_page.as_ref().map(|page| page.columns.clone()))
+            .unwrap_or_default()
+    }
+
+    fn open_table_copy_menu(&mut self) {
+        self.table_copy_stage = Some(TableCopyStage::Menu);
+        self.table_copy_source = None;
+        self.table_copy_menu_index = 0;
+        self.status = "Elige qué copiar".to_owned();
+    }
+
+    fn open_table_header_choice(&mut self, source: TableCopySource) {
+        self.table_copy_stage = Some(TableCopyStage::HeaderChoice);
+        self.table_copy_source = Some(source);
+        self.status = "¿Copiar también la cabecera? y/n".to_owned();
+    }
+
+    fn handle_table_copy_key(&mut self, key: KeyEvent) {
+        match self.table_copy_stage {
+            Some(TableCopyStage::Menu) => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.table_copy_menu_index = (self.table_copy_menu_index + 1).min(2);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.table_copy_menu_index = self.table_copy_menu_index.saturating_sub(1);
+                }
+                KeyCode::Enter => {
+                    let source = match self.table_copy_menu_index {
+                        0 => TableCopySource::LoadedData,
+                        1 => TableCopySource::CurrentRow,
+                        _ => TableCopySource::CurrentColumn,
+                    };
+                    self.open_table_header_choice(source);
+                }
+                _ => {}
+            },
+            Some(TableCopyStage::HeaderChoice) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if let Some(source) = self.table_copy_source.take() {
+                        self.table_copy_stage = None;
+                        self.copy_table_source(source, true);
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
+                    if let Some(source) = self.table_copy_source.take() {
+                        self.table_copy_stage = None;
+                        self.copy_table_source(source, false);
+                    }
+                }
+                _ => {}
+            },
+            None => {}
+        }
+    }
+
+    fn copy_table_metadata(&mut self) {
+        let Some(metadata) = self.table_metadata.as_ref() else {
+            self.status = "No hay metadata para copiar".to_owned();
+            return;
+        };
+
+        let mut lines = vec!["ordinal\tcolumn\ttype\tnullable".to_owned()];
+        lines.extend(metadata.columns.iter().map(|column| {
+            format!(
+                "{}\t{}\t{}\t{}",
+                column.ordinal_position,
+                column.name,
+                format_table_type(column),
+                if column.nullable { "NULL" } else { "NOT NULL" }
+            )
+        }));
+        lines.push(String::new());
+        lines.push("index\tcolumns\tunique\tprimary".to_owned());
+        lines.extend(metadata.indexes.iter().map(|index| {
+            format!(
+                "{}\t{}\t{}\t{}",
+                index.name,
+                index.columns.join(", "),
+                index.is_unique,
+                index.is_primary
+            )
+        }));
+        self.copy_text(lines.join("\n"), "Metadata copiada");
+    }
+
+    fn copy_table_source(&mut self, source: TableCopySource, include_header: bool) {
+        let Some(page) = self.table_page.clone() else {
+            self.status = "No hay datos cargados para copiar".to_owned();
+            return;
+        };
+        let column = self
+            .table_column_index
+            .min(page.columns.len().saturating_sub(1));
+        let text = table_copy_text(
+            &page,
+            source,
+            self.table_state.selected(),
+            column,
+            self.table_visual_anchor,
+            include_header,
+        );
+        let Some(text) = text else {
+            self.status = match source {
+                TableCopySource::CurrentCell | TableCopySource::CurrentRow => {
+                    "No hay una fila seleccionada".to_owned()
+                }
+                TableCopySource::VisualSelection => "No hay una selección visual activa".to_owned(),
+                _ => "No hay datos cargados para copiar".to_owned(),
+            };
+            return;
+        };
+        let label = match source {
+            TableCopySource::LoadedData => "Datos copiados",
+            TableCopySource::CurrentCell => "Celda copiada",
+            TableCopySource::CurrentRow => "Fila copiada",
+            TableCopySource::CurrentColumn => "Columna copiada",
+            TableCopySource::VisualSelection => "Selección copiada",
+        };
+        self.copy_text(text, label);
+        self.table_visual_anchor = None;
+        self.table_copy_stage = None;
+        self.table_copy_source = None;
+    }
+
+    fn copy_text(&mut self, text: String, label: &str) {
+        match services::clipboard::copy_text(&text) {
+            Ok(()) => self.status = format!("{label} al portapapeles"),
+            Err(error) => self.status = format!("ERROR al copiar al portapapeles: {error}"),
+        }
+    }
     fn handle_search_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
+            self.flush_search_refresh();
             self.search = None;
             self.mode = AppMode::Browser;
             return;
         }
 
         if key.code == KeyCode::Tab {
+            self.flush_search_refresh();
             self.accept_search_suggestion();
             return;
         }
 
         if key.code == KeyCode::Up {
+            self.flush_search_refresh();
             self.move_search_suggestion(-1);
             return;
         }
 
         if key.code == KeyCode::Down {
+            self.flush_search_refresh();
             self.move_search_suggestion(1);
             return;
         }
 
         if key.code == KeyCode::Enter {
+            self.flush_search_refresh();
             let Some(session) = self.search.take() else {
                 self.mode = AppMode::Browser;
                 return;
@@ -525,6 +982,7 @@ impl App {
             if let Some(session) = self.search.as_mut() {
                 session.input = TextArea::default();
                 session.selected_suggestion = 0;
+                session.refresh_deadline = None;
             }
 
             self.active_search = None;
@@ -537,7 +995,7 @@ impl App {
             session.input.input(input);
         }
 
-        self.refresh_search_suggestions();
+        self.schedule_search_refresh();
     }
 
     fn move_search_suggestion(&mut self, delta: isize) {
@@ -597,16 +1055,55 @@ impl App {
         }
     }
 
+    fn schedule_search_refresh(&mut self) {
+        if let Some(session) = self.search.as_mut() {
+            session.refresh_deadline = Some(Instant::now() + Duration::from_millis(120));
+        }
+    }
+
+    fn flush_search_refresh_if_due(&mut self) {
+        let due = self
+            .search
+            .as_ref()
+            .and_then(|session| session.refresh_deadline)
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if due {
+            self.flush_search_refresh();
+        }
+    }
+
+    fn flush_search_refresh(&mut self) {
+        let scheduled = self
+            .search
+            .as_mut()
+            .and_then(|session| session.refresh_deadline.take())
+            .is_some();
+        if scheduled {
+            self.refresh_search_suggestions();
+        }
+    }
+
     fn search_suggestions(&self, query: &str) -> Vec<CatalogEntry> {
         let query = query.trim();
-        self.catalog
-            .entries()
-            .into_iter()
-            .filter(|entry| {
-                query.is_empty()
-                    || crate::search::matches(&entry.search_text(), query)
-                    || crate::search::matches(&entry.path(), query)
+        let prepared_query = crate::search::prepare_query(query);
+        let mut matches = self
+            .search_index
+            .iter()
+            .filter_map(|entry| {
+                if query.is_empty() {
+                    return Some((None, entry.entry.clone()));
+                }
+                let score = crate::search::best_prepared_match_score(
+                    [&entry.search_text, &entry.path],
+                    &prepared_query,
+                )?;
+                Some((Some(score), entry.entry.clone()))
             })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(score, _)| *score);
+        matches
+            .into_iter()
+            .map(|(_, entry)| entry)
             .take(8)
             .collect()
     }
@@ -950,6 +1447,8 @@ impl App {
         self.table_metadata = None;
         self.table_page = None;
         self.table_query = TableQuery::new(PageRequest::default());
+        self.table_filter_expression.clear();
+        self.filter_session = None;
         self.table_loading_more = false;
         self.current_content_object = Some(object.clone());
         self.send(WorkerRequest::LoadTableMetadata {
@@ -974,6 +1473,28 @@ impl App {
         self.send(WorkerRequest::QueryTable {
             request_id,
             connection_index,
+            database,
+            object,
+            query: self.table_query.clone(),
+            profile,
+        });
+    }
+
+    fn load_table_query_page(&mut self, status: &str) {
+        let Some(object) = self.current_content_object.clone() else {
+            self.status = "No hay una tabla activa".to_owned();
+            return;
+        };
+        let Some(profile) = self.current_profile().cloned() else {
+            return;
+        };
+        let Some(database) = self.current_database().map(ToOwned::to_owned) else {
+            return;
+        };
+        let request_id = self.begin_request(status);
+        self.send(WorkerRequest::QueryTable {
+            request_id,
+            connection_index: self.connection_index,
             database,
             object,
             query: self.table_query.clone(),
@@ -1247,6 +1768,8 @@ impl App {
                         self.highlighted_content = None;
                         self.table_page = None;
                         self.table_metadata = None;
+                        self.table_filter_expression.clear();
+                        self.filter_session = None;
 
                         self.status = format!("{} {} cargados", self.objects.len(), kind);
                         if let Some(target) = self.pending_catalog_target.take() {
@@ -1285,6 +1808,8 @@ impl App {
                         self.highlighted_content = Some(ui::highlight_sql(&definition));
                         self.table_page = None;
                         self.table_metadata = None;
+                        self.table_filter_expression.clear();
+                        self.filter_session = None;
                         self.table_show_metadata = false;
                         self.current_content_object = Some(object.clone());
                         self.status = format!("Definición cargada: {}", object.qualified_name());
@@ -1335,6 +1860,8 @@ impl App {
                         }
                         self.table_page = Some(page);
                         self.table_metadata = None;
+                        self.table_filter_expression.clear();
+                        self.filter_session = None;
                         self.table_show_metadata = false;
                         self.current_content_object = Some(object);
                         self.highlighted_content = None;
@@ -1426,7 +1953,11 @@ impl App {
                         self.status = if loading_more {
                             "Más filas cargadas".to_owned()
                         } else {
-                            "Tabla cargada".to_owned()
+                            if self.table_filter_expression.is_empty() {
+                                "Tabla cargada".to_owned()
+                            } else {
+                                "Tabla filtrada".to_owned()
+                            }
                         };
                     }
                     Err(error) => {
@@ -1454,6 +1985,8 @@ impl App {
                         self.highlighted_content = None;
                         self.table_page = None;
                         self.table_metadata = None;
+                        self.table_filter_expression.clear();
+                        self.filter_session = None;
                         self.table_show_metadata = false;
                         if output.success {
                             if let Some(session) = self.editor.as_mut() {
@@ -1484,6 +2017,7 @@ impl App {
                         let skipped_databases = refresh.skipped_databases.len();
                         let skipped_kinds = refresh.skipped_kinds.len();
                         self.catalog.upsert(refresh.connection);
+                        self.rebuild_search_index();
                         if let Err(error) = self.catalog.save() {
                             self.status =
                                 format!("Catálogo actualizado, pero no guardado: {error:#}");
@@ -1512,6 +2046,10 @@ impl App {
             return;
         };
         self.navigate_to_catalog_entry(target);
+    }
+
+    fn rebuild_search_index(&mut self) {
+        self.search_index = self.catalog.search_entries();
     }
 
     fn begin_request(&mut self, status: impl Into<String>) -> u64 {
@@ -1559,6 +2097,173 @@ fn shifted_index(current: usize, len: usize, delta: isize) -> usize {
         current.saturating_sub(delta.unsigned_abs()).min(len - 1)
     } else {
         current.saturating_add(delta as usize).min(len - 1)
+    }
+}
+
+fn table_filter_suggestions(expression: &str, columns: &[String]) -> Vec<FilterSuggestion> {
+    let has_trailing_space = expression.chars().last().is_some_and(char::is_whitespace);
+    let token_start = if has_trailing_space {
+        expression.len()
+    } else {
+        expression
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, _)| index + 1)
+    };
+    let token = &expression[token_start..];
+    let prefix = &expression[..token_start];
+    let normalized_prefix = prefix.trim_end().to_ascii_uppercase();
+    let expecting_column = prefix.trim().is_empty()
+        || normalized_prefix.ends_with("AND")
+        || normalized_prefix.ends_with('(');
+    let mut suggestions = Vec::new();
+
+    if expecting_column {
+        let mut matches = columns
+            .iter()
+            .filter_map(|column| {
+                let score = crate::search::score(column, token)?;
+                Some((score, column))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(score, _)| *score);
+        suggestions.extend(matches.into_iter().map(|(_, column)| FilterSuggestion {
+            label: column.clone(),
+            insertion: format!("{column} "),
+            replace_start: token_start,
+        }));
+        return suggestions;
+    }
+
+    let operators = [
+        ("=", "= "),
+        ("!=", "!= "),
+        ("<>", "<> "),
+        (">=", ">= "),
+        ("<=", "<= "),
+        (">", "> "),
+        ("<", "< "),
+        ("LIKE", "LIKE "),
+        ("NOT LIKE", "NOT LIKE "),
+        ("IS NULL", "IS NULL "),
+        ("IS NOT NULL", "IS NOT NULL "),
+    ];
+    if prefix.trim_end().split_whitespace().count() <= 1 {
+        suggestions.extend(
+            operators
+                .iter()
+                .filter(|(label, _)| {
+                    token.is_empty()
+                        || label
+                            .to_ascii_lowercase()
+                            .starts_with(&token.to_ascii_lowercase())
+                })
+                .map(|(label, insertion)| FilterSuggestion {
+                    label: (*label).to_owned(),
+                    insertion: (*insertion).to_owned(),
+                    replace_start: token_start,
+                }),
+        );
+    } else if normalized_prefix.ends_with("IS NULL") || normalized_prefix.ends_with("IS NOT NULL") {
+        suggestions.push(FilterSuggestion {
+            label: "AND".to_owned(),
+            insertion: "AND ".to_owned(),
+            replace_start: token_start,
+        });
+    } else if normalized_prefix.ends_with("IS NOT") {
+        suggestions.extend(
+            [("NULL", "NULL ")]
+                .iter()
+                .filter(|(label, _)| {
+                    token.is_empty()
+                        || label
+                            .to_ascii_lowercase()
+                            .starts_with(&token.to_ascii_lowercase())
+                })
+                .map(|(label, insertion)| FilterSuggestion {
+                    label: (*label).to_owned(),
+                    insertion: (*insertion).to_owned(),
+                    replace_start: token_start,
+                }),
+        );
+    } else if normalized_prefix.ends_with("IS") {
+        suggestions.extend(
+            [("NULL", "NULL "), ("NOT NULL", "NOT NULL ")]
+                .iter()
+                .filter(|(label, _)| {
+                    token.is_empty()
+                        || label
+                            .to_ascii_lowercase()
+                            .starts_with(&token.to_ascii_lowercase())
+                })
+                .map(|(label, insertion)| FilterSuggestion {
+                    label: (*label).to_owned(),
+                    insertion: (*insertion).to_owned(),
+                    replace_start: token_start,
+                }),
+        );
+    } else if normalized_prefix.ends_with("NOT") {
+        suggestions.push(FilterSuggestion {
+            label: "LIKE".to_owned(),
+            insertion: "LIKE ".to_owned(),
+            replace_start: token_start,
+        });
+    } else if normalized_prefix.ends_with('=')
+        || normalized_prefix.ends_with("!=")
+        || normalized_prefix.ends_with("<>")
+        || normalized_prefix.ends_with('>')
+        || normalized_prefix.ends_with('<')
+        || normalized_prefix.ends_with("LIKE")
+    {
+        suggestions.push(FilterSuggestion {
+            label: "valor…".to_owned(),
+            insertion: "'' ".to_owned(),
+            replace_start: token_start,
+        });
+    } else {
+        suggestions.extend(
+            ["AND"]
+                .iter()
+                .filter(|keyword| {
+                    keyword
+                        .to_ascii_lowercase()
+                        .starts_with(&token.to_ascii_lowercase())
+                })
+                .map(|keyword| FilterSuggestion {
+                    label: (*keyword).to_owned(),
+                    insertion: "AND ".to_owned(),
+                    replace_start: token_start,
+                }),
+        );
+    }
+    suggestions
+}
+
+fn format_filter_spec(filter: &FilterSpec) -> String {
+    let operator = match filter.operator {
+        FilterOperator::Equals => "=",
+        FilterOperator::NotEquals => "!=",
+        FilterOperator::Contains => "contains",
+        FilterOperator::StartsWith => "starts with",
+        FilterOperator::EndsWith => "ends with",
+        FilterOperator::GreaterThan => ">",
+        FilterOperator::GreaterThanOrEqual => ">=",
+        FilterOperator::LessThan => "<",
+        FilterOperator::LessThanOrEqual => "<=",
+        FilterOperator::Like => "LIKE",
+        FilterOperator::NotLike => "NOT LIKE",
+        FilterOperator::IsNull => "IS NULL",
+        FilterOperator::IsNotNull => "IS NOT NULL",
+    };
+    match filter.value.as_deref() {
+        Some(value) => format!(
+            "{} {} '{}'",
+            filter.column,
+            operator,
+            value.replace('\'', "''")
+        ),
+        None => format!("{} {}", filter.column, operator),
     }
 }
 
@@ -1651,9 +2356,83 @@ fn format_key(key: KeyEvent) -> String {
     parts.join("+")
 }
 
+fn format_table_type(column: &crate::db::models::ColumnMetadata) -> String {
+    match column.data_type.to_ascii_lowercase().as_str() {
+        "char" | "varchar" | "nchar" | "nvarchar" | "binary" | "varbinary" | "unichar"
+        | "univarchar" => column.length.map_or_else(
+            || column.data_type.clone(),
+            |length| format!("{}({length})", column.data_type),
+        ),
+        "numeric" | "decimal" => match (column.precision, column.scale) {
+            (Some(precision), Some(scale)) => {
+                format!("{}({precision},{scale})", column.data_type)
+            }
+            _ => column.data_type.clone(),
+        },
+        _ => column.data_type.clone(),
+    }
+}
+
+fn table_copy_text(
+    page: &TablePage,
+    source: TableCopySource,
+    selected_row: Option<usize>,
+    selected_column: usize,
+    visual_anchor: Option<(usize, usize)>,
+    include_header: bool,
+) -> Option<String> {
+    if page.columns.is_empty() {
+        return None;
+    }
+
+    let column = selected_column.min(page.columns.len() - 1);
+    let (start_row, end_row, start_column, end_column) = match source {
+        TableCopySource::LoadedData => (0, page.rows.len(), 0, page.columns.len()),
+        TableCopySource::CurrentCell => {
+            let row = selected_row?;
+            (row, row.saturating_add(1), column, column.saturating_add(1))
+        }
+        TableCopySource::CurrentRow => {
+            let row = selected_row?;
+            (row, row.saturating_add(1), 0, page.columns.len())
+        }
+        TableCopySource::CurrentColumn => (0, page.rows.len(), column, column.saturating_add(1)),
+        TableCopySource::VisualSelection => {
+            let row = selected_row?;
+            let (anchor_row, anchor_column) = visual_anchor?;
+            (
+                anchor_row.min(row),
+                anchor_row.max(row).saturating_add(1),
+                anchor_column.min(column),
+                anchor_column.max(column).saturating_add(1),
+            )
+        }
+    };
+
+    if end_row > page.rows.len() || end_column > page.columns.len() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if include_header {
+        lines.push(page.columns[start_column..end_column].join("\t"));
+    }
+    lines.extend(
+        page.rows[start_row..end_row]
+            .iter()
+            .map(|values| values[start_column..end_column].join("\t")),
+    );
+    Some(lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_write_sql, normalize_definition_for_edit, shifted_index};
+    use super::{
+        TableCopySource, format_table_type, is_write_sql, normalize_definition_for_edit,
+        shifted_index, table_copy_text, table_filter_suggestions,
+    };
+    use crate::db::models::{ColumnMetadata, TablePage};
+    use crate::db::query::PageCursor;
 
     #[test]
     fn detects_writes_conservatively() {
@@ -1683,5 +2462,95 @@ mod tests {
         assert_eq!(shifted_index(1, 3, 1), 2);
         assert_eq!(shifted_index(2, 3, 1), 2);
         assert_eq!(shifted_index(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn formats_parameterized_table_types_for_copy() {
+        let varchar = ColumnMetadata {
+            name: "name".to_owned(),
+            data_type: "varchar".to_owned(),
+            length: Some(255),
+            precision: None,
+            scale: None,
+            nullable: true,
+            ordinal_position: 1,
+        };
+        let numeric = ColumnMetadata {
+            data_type: "numeric".to_owned(),
+            precision: Some(12),
+            scale: Some(2),
+            ..varchar.clone()
+        };
+
+        assert_eq!(format_table_type(&varchar), "varchar(255)");
+        assert_eq!(format_table_type(&numeric), "numeric(12,2)");
+    }
+
+    #[test]
+    fn serializes_a_visual_selection_as_tsv_with_optional_header() {
+        let page = TablePage::new(
+            vec!["id".to_owned(), "name".to_owned(), "status".to_owned()],
+            vec![
+                vec!["1".to_owned(), "Ada".to_owned(), "active".to_owned()],
+                vec!["2".to_owned(), "Lin".to_owned(), "blocked".to_owned()],
+            ],
+            Some(PageCursor::Offset(2)),
+            false,
+            None,
+        )
+        .expect("valid table page");
+
+        assert_eq!(
+            table_copy_text(
+                &page,
+                TableCopySource::VisualSelection,
+                Some(1),
+                2,
+                Some((0, 1)),
+                true,
+            )
+            .as_deref(),
+            Some("name\tstatus\nAda\tactive\nLin\tblocked")
+        );
+    }
+
+    #[test]
+    fn serializes_current_cell_without_header() {
+        let page = TablePage::new(
+            vec!["id".to_owned(), "name".to_owned()],
+            vec![vec!["1".to_owned(), "Ada".to_owned()]],
+            None,
+            false,
+            None,
+        )
+        .expect("valid table page");
+
+        assert_eq!(
+            table_copy_text(&page, TableCopySource::CurrentCell, Some(0), 1, None, false)
+                .as_deref(),
+            Some("Ada")
+        );
+    }
+
+    #[test]
+    fn suggests_columns_and_operators_from_filter_context() {
+        let columns = vec!["status".to_owned(), "total".to_owned()];
+
+        let columns_suggestions = table_filter_suggestions("sta", &columns);
+        assert_eq!(columns_suggestions[0].label, "status");
+
+        let operators = table_filter_suggestions("status ", &columns);
+        assert!(
+            operators
+                .iter()
+                .any(|suggestion| suggestion.label == "LIKE")
+        );
+
+        let next_columns = table_filter_suggestions("status = 'active' AND ", &columns);
+        assert!(
+            next_columns
+                .iter()
+                .any(|suggestion| suggestion.label == "total")
+        );
     }
 }

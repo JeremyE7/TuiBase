@@ -13,7 +13,7 @@ use ratatui::{
 pub mod syntax;
 
 use crate::{
-    app::{App, AppMode, Focus},
+    app::{App, AppMode, Focus, TableCopyStage},
     db::models::ObjectKind,
 };
 
@@ -24,6 +24,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         AppMode::Editor => render_editor(frame, app),
         AppMode::Table => render_full_table(frame, app),
         _ => render_browser(frame, app),
+    }
+
+    if app.mode == AppMode::Table && app.current_filter_session().is_some() {
+        render_table_filter_overlay(frame, app);
+    } else if app.mode == AppMode::Table && app.table_copy_stage.is_some() {
+        render_table_copy_overlay(frame, app);
     }
 
     match app.mode {
@@ -195,14 +201,38 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
     )
     .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows = page.rows.iter().map(|values| {
-        Row::new(
-            column_range
-                .clone()
-                .map(|index| values.get(index).map(|value| value.as_str()).unwrap_or("")),
+    let selected_row = app.table_state.selected();
+    let visual_range = app.table_visual_anchor.map(|(anchor_row, anchor_column)| {
+        let row = selected_row.unwrap_or(anchor_row);
+        (
+            anchor_row.min(row),
+            anchor_row.max(row),
+            anchor_column.min(app.table_column_index),
+            anchor_column.max(app.table_column_index),
         )
     });
+    let rows = page.rows.iter().enumerate().map(|(row_index, values)| {
+        Row::new(column_range.clone().map(|index| {
+            let value = values.get(index).map(|value| value.as_str()).unwrap_or("");
+            let selected =
+                visual_range.is_some_and(|(row_start, row_end, column_start, column_end)| {
+                    row_index >= row_start
+                        && row_index <= row_end
+                        && index >= column_start
+                        && index <= column_end
+                });
+            if selected {
+                Span::styled(value, Style::default().bg(Color::Blue).fg(Color::White))
+            } else {
+                Span::raw(value)
+            }
+        }))
+    });
 
+    let filter_label = app
+        .active_table_filter()
+        .map(|filter| format!(" · filtro: {filter}"))
+        .unwrap_or_default();
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(COLUMN_SPACING as u16)
@@ -211,7 +241,7 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         .cell_highlight_style(Style::default().bg(Color::LightYellow).fg(Color::Black))
         .block(panel_block(
             format!(
-                " Tabla · {} · {} cols · {} índices{} · Esc salir ",
+                " Tabla · {} · {} cols · {} índices{}{} · Esc salir ",
                 app.content_title,
                 app.table_metadata
                     .as_ref()
@@ -225,7 +255,8 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
                     " · más filas disponibles"
                 } else {
                     ""
-                }
+                },
+                filter_label,
             ),
             true,
         ));
@@ -246,6 +277,113 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         }),
         &mut app.horizontal_scroll,
     );
+}
+
+fn render_table_copy_overlay(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(64, 42, frame.area());
+    frame.render_widget(Clear, area);
+    let Some(stage) = app.table_copy_stage else {
+        return;
+    };
+    let content = match stage {
+        TableCopyStage::Menu => {
+            let options = [
+                "Datos cargados actualmente",
+                "Fila actual",
+                "Columna actual",
+            ];
+            let lines = options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    let marker = if index == app.table_copy_menu_index {
+                        "▸"
+                    } else {
+                        " "
+                    };
+                    Line::from(format!("{marker} {option}"))
+                })
+                .collect::<Vec<_>>();
+            Paragraph::new(Text::from(lines))
+                .block(panel_block(" Copiar · j/k · Enter · Esc ", true))
+        }
+        TableCopyStage::HeaderChoice => {
+            Paragraph::new("¿Copiar también la cabecera?\n\ny: sí\nn/Enter: no\nEsc: cancelar")
+                .block(panel_block(" Copiar ", true))
+        }
+    };
+    frame.render_widget(content, area);
+}
+
+fn render_table_filter_overlay(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(82, 68, frame.area());
+    frame.render_widget(Clear, area);
+
+    let outer = panel_block(
+        " Filtrar tabla · Tab completa · Enter aplica · Esc cancela ",
+        true,
+    );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Min(3),
+        ])
+        .split(inner);
+    let Some(session) = app.current_filter_session() else {
+        return;
+    };
+
+    let input_block = panel_block(" Expresión ", false);
+    frame.render_widget(input_block.clone(), sections[0]);
+    frame.render_widget(&session.input, input_block.inner(sections[0]));
+
+    let items = session
+        .suggestions
+        .iter()
+        .map(|suggestion| ListItem::new(suggestion.label.clone()))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(
+            session
+                .selected_suggestion
+                .min(items.len().saturating_sub(1)),
+        ));
+    }
+    let suggestions = List::new(items)
+        .block(panel_block(" Sugerencias ", false))
+        .highlight_symbol("▸ ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
+    frame.render_stateful_widget(suggestions, sections[1], &mut state);
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Condiciones interpretadas",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if session.preview.is_empty() {
+        lines.push(Line::from(
+            session
+                .parse_error
+                .as_deref()
+                .unwrap_or("Escribe una condición para comenzar"),
+        ));
+    } else {
+        lines.extend(
+            session
+                .preview
+                .iter()
+                .map(|condition| Line::from(format!("✓ {condition}"))),
+        );
+    }
+    let preview = Paragraph::new(Text::from(lines))
+        .block(panel_block(" Vista previa ", false))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(preview, sections[2]);
 }
 
 fn render_table_metadata(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -513,7 +651,10 @@ fn render_help(frame: &mut Frame<'_>) {
         "  E             editar datos T-SQL  :          consulta T-SQL",
         "\nTABLA",
         "  i             metadata de columnas e índices",
-        "  j/k           desplazarse en metadata     Esc/q salir",
+        "  y             copiar celda/metadata       Y menú de copia",
+        "  v             selección visual            Esc cancela",
+        "  j/k           desplazarse                h/l mover columna",
+        "  f             filtro con autocompletado  F limpiar filtro",
         "  ?             ayuda               q          salir",
         "",
         "EDITOR NVIM-LIKE",
