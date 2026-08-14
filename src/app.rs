@@ -1,11 +1,11 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     path::PathBuf,
     time::{Duration, Instant},
 };
 
 use crate::catalog::{CatalogCache, CatalogEntry, SearchCatalogEntry, connection_key};
-use crate::db::models::{TableMetadata, TablePage};
+use crate::db::models::{ColumnMetadata, TableMetadata, TablePage};
 use crate::services;
 use crate::table_preferences::{TablePreferences, table_preference_key};
 use crate::ui;
@@ -18,7 +18,7 @@ use ratatui_textarea::{CursorMove, Input, TextArea};
 use crate::{
     config::{AppConfig, ConnectionProfile},
     db::{
-        models::{DbObject, ObjectKind},
+        models::{DbObject, ObjectKind, SqlOutput},
         query::{
             FilterOperator, FilterSpec, PageRequest, SortDirection, SortSpec, TableQuery,
             parse_filter_expression, parse_sort_expression,
@@ -46,6 +46,7 @@ pub enum TableCopySource {
     CurrentRow,
     CurrentColumn,
     VisualSelection,
+    VisualRows,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +100,80 @@ pub struct ColumnSearchSession {
     pub selected_suggestion: usize,
 }
 
+pub struct TableValueModal {
+    pub column: String,
+    pub data_type: String,
+    pub row_number: usize,
+    pub value: String,
+}
+
+pub struct TableCellEditorSession {
+    pub column: String,
+    pub data_type: String,
+    pub row_number: usize,
+    pub nullable: bool,
+    pub original_value: String,
+    pub input: TextArea<'static>,
+    row_index: usize,
+    metadata: ColumnMetadata,
+}
+
+pub struct TableDateTimePickerSession {
+    pub column: String,
+    pub data_type: String,
+    pub row_number: usize,
+    pub nullable: bool,
+    pub show_date: bool,
+    pub show_time: bool,
+    pub is_null: bool,
+    pub selected_component: usize,
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub fractional_seconds: String,
+    original_value: String,
+    row_index: usize,
+    metadata: ColumnMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCellDraft {
+    pub row_index: usize,
+    pub column: String,
+    pub original_value: String,
+    pub value: String,
+}
+
+pub struct TableChangesSummary {
+    pub edited_cells: Vec<String>,
+    pub deleted_rows: Vec<usize>,
+    pub new_row_count: usize,
+    pub identity_columns: Vec<String>,
+    pub identity_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableDateTimeKind {
+    Date,
+    DateTime,
+    Time,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedTableDateTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    fractional_seconds: String,
+    is_null: bool,
+}
+
 impl Focus {
     fn next(self) -> Self {
         match self {
@@ -137,7 +212,9 @@ pub struct EditorSession {
 #[derive(Debug, Clone)]
 enum ConfirmAction {
     Execute { sql: String },
+    ExecuteTableChanges { sql: String },
     DiscardEditor,
+    DiscardTableChanges,
 }
 
 pub struct App {
@@ -171,9 +248,24 @@ pub struct App {
     pub table_visible_columns: usize,
     pub table_show_metadata: bool,
     pub table_visual_anchor: Option<(usize, usize)>,
+    pub table_row_visual_anchor: Option<usize>,
     pub table_copy_stage: Option<TableCopyStage>,
     pub table_copy_source: Option<TableCopySource>,
     pub table_copy_menu_index: usize,
+    pub table_value_modal: Option<TableValueModal>,
+    pub table_value_scroll: u16,
+    pub table_cell_editor: Option<TableCellEditorSession>,
+    pub table_date_time_picker: Option<TableDateTimePickerSession>,
+    pub table_cell_drafts: Vec<TableCellDraft>,
+    pub table_row_deletions: BTreeSet<usize>,
+    pub table_new_rows: BTreeSet<usize>,
+    table_delete_sequence_armed: bool,
+    pub table_changes_summary: Option<TableChangesSummary>,
+    pub table_changes_summary_scroll: u16,
+    pub table_sql_preview: Option<sybase::queries::TableSqlPreview>,
+    pub table_sql_preview_scroll: u16,
+    search_return_mode: AppMode,
+    help_return_mode: AppMode,
     search: Option<SearchSession>,
     filter_session: Option<FilterSession>,
     sort_session: Option<SortSession>,
@@ -184,6 +276,7 @@ pub struct App {
     table_preferences: TablePreferences,
     catalog_refresh_pending: HashSet<usize>,
     pending_catalog_target: Option<CatalogEntry>,
+    pending_table_navigation: Option<CatalogEntry>,
     last_catalog_refresh_check: Instant,
     request_tx: Sender<WorkerRequest>,
     response_rx: Receiver<WorkerResponse>,
@@ -194,6 +287,7 @@ pub struct App {
     confirm_action: Option<ConfirmAction>,
     confirm_message: String,
     return_to_editor_after_execution: bool,
+    return_to_table_after_execution: bool,
 }
 
 impl App {
@@ -234,9 +328,24 @@ impl App {
             table_visible_columns: 0,
             table_show_metadata: false,
             table_visual_anchor: None,
+            table_row_visual_anchor: None,
             table_copy_stage: None,
             table_copy_source: None,
             table_copy_menu_index: 0,
+            table_value_modal: None,
+            table_value_scroll: 0,
+            table_cell_editor: None,
+            table_date_time_picker: None,
+            table_cell_drafts: Vec::new(),
+            table_row_deletions: BTreeSet::new(),
+            table_new_rows: BTreeSet::new(),
+            table_delete_sequence_armed: false,
+            table_changes_summary: None,
+            table_changes_summary_scroll: 0,
+            table_sql_preview: None,
+            table_sql_preview_scroll: 0,
+            search_return_mode: AppMode::Browser,
+            help_return_mode: AppMode::Browser,
             filter_session: None,
             sort_session: None,
             column_search_session: None,
@@ -253,6 +362,7 @@ impl App {
             confirm_action: None,
             confirm_message: String::new(),
             return_to_editor_after_execution: false,
+            return_to_table_after_execution: false,
             search: None,
             active_search: None,
             catalog,
@@ -260,6 +370,7 @@ impl App {
             table_preferences,
             catalog_refresh_pending: HashSet::new(),
             pending_catalog_target: None,
+            pending_table_navigation: None,
             last_catalog_refresh_check: Instant::now(),
         }
     }
@@ -292,6 +403,33 @@ impl App {
 
     pub fn current_column_search_session(&self) -> Option<&ColumnSearchSession> {
         self.column_search_session.as_ref()
+    }
+
+    pub fn current_table_value_modal(&self) -> Option<&TableValueModal> {
+        self.table_value_modal.as_ref()
+    }
+
+    pub fn current_table_cell_editor(&self) -> Option<&TableCellEditorSession> {
+        self.table_cell_editor.as_ref()
+    }
+
+    pub fn current_table_date_time_picker(&self) -> Option<&TableDateTimePickerSession> {
+        self.table_date_time_picker.as_ref()
+    }
+
+    pub fn current_table_changes_summary(&self) -> Option<&TableChangesSummary> {
+        self.table_changes_summary.as_ref()
+    }
+
+    pub fn current_table_sql_preview(&self) -> Option<&sybase::queries::TableSqlPreview> {
+        self.table_sql_preview.as_ref()
+    }
+
+    pub fn table_cell_draft_value(&self, row_index: usize, column: &str) -> Option<&str> {
+        self.table_cell_drafts
+            .iter()
+            .find(|draft| draft.row_index == row_index && draft.column.eq_ignore_ascii_case(column))
+            .map(|draft| draft.value.as_str())
     }
 
     pub fn active_table_filter(&self) -> Option<&str> {
@@ -372,7 +510,7 @@ impl App {
                     key.code,
                     KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
                 ) {
-                    self.mode = AppMode::Browser;
+                    self.mode = self.help_return_mode;
                 }
             }
         }
@@ -408,7 +546,7 @@ impl App {
             KeyCode::Char('e') => self.edit_selected_object(),
             KeyCode::Char('E') => self.edit_table_values(),
             KeyCode::Char(':') => self.open_query_editor(),
-            KeyCode::Char('?') => self.mode = AppMode::Help,
+            KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('1') => self.focus = Focus::Connections,
             KeyCode::Char('2') => self.focus = Focus::Databases,
             KeyCode::Char('3') => self.focus = Focus::Kinds,
@@ -438,6 +576,7 @@ impl App {
     }
 
     fn open_search(&mut self) {
+        self.search_return_mode = self.mode;
         self.search = Some(SearchSession {
             input: TextArea::default(),
             suggestions: Vec::new(),
@@ -447,6 +586,11 @@ impl App {
 
         self.mode = AppMode::Search;
         self.refresh_search_suggestions();
+    }
+
+    fn open_help(&mut self) {
+        self.help_return_mode = self.mode;
+        self.mode = AppMode::Help;
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
@@ -481,6 +625,51 @@ impl App {
     }
 
     fn handle_table_key(&mut self, key: KeyEvent) {
+        if self.table_date_time_picker.is_some() {
+            self.handle_table_date_time_picker_key(key);
+            return;
+        }
+
+        if self.table_cell_editor.is_some() {
+            self.handle_table_cell_editor_key(key);
+            return;
+        }
+
+        if self.table_sql_preview.is_some() {
+            self.handle_table_sql_preview_key(key);
+            return;
+        }
+
+        if self.table_changes_summary.is_some() {
+            self.handle_table_changes_summary_key(key);
+            return;
+        }
+
+        if self.table_value_modal.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.table_value_modal = None;
+                    self.table_value_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.table_value_scroll = self.table_value_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.table_value_scroll = self.table_value_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.table_value_scroll = self.table_value_scroll.saturating_sub(8);
+                }
+                KeyCode::PageDown => {
+                    self.table_value_scroll = self.table_value_scroll.saturating_add(8);
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.table_value_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => self.table_value_scroll = u16::MAX,
+                _ => {}
+            }
+            return;
+        }
+
         if key.code == KeyCode::Esc {
             if self.filter_session.is_some() {
                 self.filter_session = None;
@@ -507,12 +696,11 @@ impl App {
                 self.status = "Selección visual cancelada".to_owned();
                 return;
             }
-            self.table_page = None;
-            self.table_metadata = None;
-            self.table_show_metadata = false;
-            self.sort_session = None;
-            self.column_search_session = None;
-            self.mode = AppMode::Browser;
+            if self.table_row_visual_anchor.take().is_some() {
+                self.status = "Selección de filas cancelada".to_owned();
+                return;
+            }
+            self.request_table_exit();
             return;
         }
 
@@ -532,15 +720,7 @@ impl App {
         }
 
         if key.code == KeyCode::Char('q') {
-            self.table_page = None;
-            self.table_metadata = None;
-            self.table_show_metadata = false;
-            self.table_visual_anchor = None;
-            self.table_copy_stage = None;
-            self.table_copy_source = None;
-            self.sort_session = None;
-            self.column_search_session = None;
-            self.mode = AppMode::Browser;
+            self.request_table_exit();
             return;
         }
 
@@ -586,6 +766,7 @@ impl App {
             self.table_show_metadata = !self.table_show_metadata;
             self.content_scroll = 0;
             self.table_visual_anchor = None;
+            self.table_row_visual_anchor = None;
             return;
         }
 
@@ -613,6 +794,23 @@ impl App {
             return;
         }
 
+        if key.code == KeyCode::Char('?') {
+            self.open_help();
+            return;
+        }
+
+        if key.code == KeyCode::Char('/') {
+            self.open_search();
+            return;
+        }
+
+        if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.open_table_changes_summary();
+            return;
+        }
+
         let Some((row_count, column_count, has_more)) = self
             .table_page
             .as_ref()
@@ -626,7 +824,70 @@ impl App {
             return;
         }
 
+        if key.code != KeyCode::Char('d') {
+            self.table_delete_sequence_armed = false;
+        }
+        if key.code == KeyCode::Char('d') {
+            if self.table_delete_sequence_armed {
+                self.copy_current_row_and_mark_for_delete();
+                self.table_delete_sequence_armed = false;
+            } else {
+                self.mark_selected_rows_for_delete();
+                self.table_delete_sequence_armed = true;
+            }
+            return;
+        }
+
+        if key.code == KeyCode::Char('u') {
+            self.undo_table_row_change();
+            return;
+        }
+
+        let clone_row = (key.code == KeyCode::Char('+')
+            && key.modifiers.contains(KeyModifiers::SHIFT))
+            || (key.code == KeyCode::Char('=') && key.modifiers.contains(KeyModifiers::SHIFT));
+        if clone_row {
+            self.append_table_new_row(true);
+            return;
+        }
+        if key.code == KeyCode::Char('+') {
+            self.append_table_new_row(false);
+            return;
+        }
+
+        if key.code == KeyCode::Char('V')
+            || (key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::SHIFT))
+        {
+            if row_count == 0 {
+                self.status = "No hay filas para seleccionar".to_owned();
+                return;
+            }
+            if self.table_row_visual_anchor.take().is_some() {
+                self.status = "Selección de filas desactivada".to_owned();
+            } else {
+                self.table_visual_anchor = None;
+                self.table_row_visual_anchor = Some(self.table_state.selected().unwrap_or(0));
+                self.status = "Selección de filas activa · mueve el cursor · y copia · Esc cancela"
+                    .to_owned();
+            }
+            return;
+        }
+
+        if key.code == KeyCode::Char('e') {
+            self.open_table_cell_editor();
+            return;
+        }
+
+        if key.code == KeyCode::Enter {
+            self.open_table_value_modal();
+            return;
+        }
+
         if key.code == KeyCode::Char('v') {
+            if self.table_row_visual_anchor.is_some() {
+                self.status = "Ya hay una selección de filas activa · Esc cancela".to_owned();
+                return;
+            }
             if self.table_visual_anchor.take().is_some() {
                 self.status = "Selección visual desactivada".to_owned();
             } else {
@@ -644,7 +905,9 @@ impl App {
         }
 
         if key.code == KeyCode::Char('y') {
-            if self.table_visual_anchor.is_some() {
+            if self.table_row_visual_anchor.is_some() {
+                self.open_table_header_choice(TableCopySource::VisualRows);
+            } else if self.table_visual_anchor.is_some() {
                 self.open_table_header_choice(TableCopySource::VisualSelection);
             } else {
                 self.copy_table_source(TableCopySource::CurrentCell, false);
@@ -665,7 +928,11 @@ impl App {
 
                 self.table_state.select(Some(next));
                 self.update_visual_status(visual);
-                if next + 1 == row_count && has_more && !self.table_loading_more {
+                if next + 1 == row_count
+                    && has_more
+                    && self.table_new_rows.is_empty()
+                    && !self.table_loading_more
+                {
                     self.load_next_table_page();
                 }
             }
@@ -721,7 +988,7 @@ impl App {
                 }
 
                 self.table_state.select(Some(row_count - 1));
-                if has_more && !self.table_loading_more {
+                if has_more && self.table_new_rows.is_empty() && !self.table_loading_more {
                     self.load_next_table_page();
                 }
                 self.update_visual_status(visual);
@@ -731,10 +998,823 @@ impl App {
         }
     }
 
+    fn open_table_value_modal(&mut self) {
+        let Some(row_index) = self.table_state.selected() else {
+            self.status = "No hay una fila seleccionada".to_owned();
+            return;
+        };
+        let Some((column, raw_value)) = self.table_page.as_ref().and_then(|page| {
+            let column = page.columns.get(self.table_column_index)?.clone();
+            let value = selected_table_value(page, Some(row_index), self.table_column_index)?;
+            Some((column, value))
+        }) else {
+            self.status = "No hay un valor seleccionado".to_owned();
+            return;
+        };
+        let value = self
+            .table_cell_draft_value(row_index, &column)
+            .map(ToOwned::to_owned)
+            .unwrap_or(raw_value);
+        let data_type = self
+            .table_metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata
+                    .columns
+                    .iter()
+                    .find(|metadata| metadata.name.eq_ignore_ascii_case(&column))
+            })
+            .map(format_table_type)
+            .unwrap_or_else(|| "desconocido".to_owned());
+
+        self.table_value_modal = Some(TableValueModal {
+            column,
+            data_type,
+            row_number: row_index.saturating_add(1),
+            value,
+        });
+        self.table_value_scroll = 0;
+        self.status = "Valor completo · j/k desplaza · Enter/Esc cierra".to_owned();
+    }
+
+    fn open_table_changes_summary(&mut self) {
+        if !self.has_pending_table_changes() {
+            self.status = "No hay cambios staged para resumir".to_owned();
+            return;
+        }
+
+        let identity_columns = self.table_identity_columns();
+        let new_rows = self.table_new_rows.clone();
+        let requires_identity = self
+            .table_cell_drafts
+            .iter()
+            .any(|draft| !new_rows.contains(&draft.row_index))
+            || self
+                .table_row_deletions
+                .iter()
+                .any(|row_index| !new_rows.contains(row_index));
+        let identity_warning = if requires_identity && identity_columns.is_empty() {
+            Some(
+                "No se detectó una clave primaria ni un índice único. Los UPDATE/DELETE requerirán una identidad segura antes de generar SQL."
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        let edited_cells = self
+            .table_cell_drafts
+            .iter()
+            .map(|draft| {
+                format!(
+                    "Fila {} · {}: {} → {}",
+                    draft.row_index.saturating_add(1),
+                    draft.column,
+                    compact_table_summary_value(&draft.original_value),
+                    compact_table_summary_value(&draft.value),
+                )
+            })
+            .collect();
+        let deleted_rows = self
+            .table_row_deletions
+            .iter()
+            .map(|row_index| row_index.saturating_add(1))
+            .collect();
+
+        self.table_changes_summary = Some(TableChangesSummary {
+            edited_cells,
+            deleted_rows,
+            new_row_count: self.table_new_rows.len(),
+            identity_columns,
+            identity_warning,
+        });
+        self.table_changes_summary_scroll = 0;
+        self.status = "Resumen de cambios · Enter abre SQL · Esc cierra".to_owned();
+    }
+
+    fn handle_table_changes_summary_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.table_changes_summary = None;
+                self.table_changes_summary_scroll = 0;
+                self.status = "Resumen de cambios cerrado".to_owned();
+            }
+            KeyCode::Enter => self.open_table_sql_preview(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.table_changes_summary_scroll =
+                    self.table_changes_summary_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.table_changes_summary_scroll =
+                    self.table_changes_summary_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.table_changes_summary_scroll =
+                    self.table_changes_summary_scroll.saturating_sub(8);
+            }
+            KeyCode::PageDown => {
+                self.table_changes_summary_scroll =
+                    self.table_changes_summary_scroll.saturating_add(8);
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.table_changes_summary_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.table_changes_summary_scroll = u16::MAX;
+            }
+            _ => {}
+        }
+    }
+
+    fn open_table_sql_preview(&mut self) {
+        let Some(metadata) = self.table_metadata.as_ref().cloned() else {
+            self.status = "No hay metadata para generar SQL staged".to_owned();
+            return;
+        };
+        let Some(page) = self.table_page.as_ref().cloned() else {
+            self.status = "No hay datos cargados para generar SQL staged".to_owned();
+            return;
+        };
+        let drafts = self
+            .table_cell_drafts
+            .iter()
+            .map(|draft| {
+                (
+                    draft.row_index,
+                    draft.column.clone(),
+                    draft.original_value.clone(),
+                    draft.value.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let deleted_rows = self.table_row_deletions.iter().copied().collect::<Vec<_>>();
+        let new_rows = self.table_new_rows.iter().copied().collect::<Vec<_>>();
+        self.table_sql_preview = Some(sybase::queries::preview_staged_table_changes(
+            &metadata,
+            &page,
+            &drafts,
+            &deleted_rows,
+            &new_rows,
+        ));
+        self.table_sql_preview_scroll = 0;
+        self.status =
+            "Vista previa SQL · Ctrl+S solicita ejecución · Esc vuelve al resumen".to_owned();
+    }
+
+    fn handle_table_sql_preview_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.request_table_sql_execution();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.table_sql_preview = None;
+                self.table_sql_preview_scroll = 0;
+                self.status = "Vista previa SQL cerrada".to_owned();
+            }
+            KeyCode::Enter => {
+                self.status = "La vista previa SQL es solo lectura".to_owned();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.table_sql_preview_scroll = self.table_sql_preview_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.table_sql_preview_scroll = self.table_sql_preview_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.table_sql_preview_scroll = self.table_sql_preview_scroll.saturating_sub(8);
+            }
+            KeyCode::PageDown => {
+                self.table_sql_preview_scroll = self.table_sql_preview_scroll.saturating_add(8);
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.table_sql_preview_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.table_sql_preview_scroll = u16::MAX,
+            _ => {}
+        }
+    }
+
+    fn request_table_sql_execution(&mut self) {
+        let Some(preview) = self.table_sql_preview.as_ref().cloned() else {
+            self.status = "No hay una vista previa SQL activa".to_owned();
+            return;
+        };
+        if !preview.blockers.is_empty() {
+            self.status =
+                "Ejecución bloqueada: corrige todos los bloqueos de la vista SQL".to_owned();
+            return;
+        }
+        if !contains_executable_table_sql(&preview.sql) {
+            self.status = "Ejecución bloqueada: no hay SQL ejecutable".to_owned();
+            return;
+        }
+        if !self
+            .current_profile()
+            .is_some_and(|profile| profile.allow_writes)
+        {
+            self.status =
+                "Escritura bloqueada: cambia allow_writes = true para esta conexión".to_owned();
+            return;
+        }
+
+        let table = self
+            .table_metadata
+            .as_ref()
+            .map(|metadata| metadata.identifier.qualified_name())
+            .unwrap_or_else(|| "la tabla actual".to_owned());
+        self.confirm_action = Some(ConfirmAction::ExecuteTableChanges { sql: preview.sql });
+        self.confirm_message =
+            format!("Se ejecutarán los cambios staged de {table}. ¿Confirmar? [y/N]");
+        self.mode = AppMode::Confirm;
+    }
+
+    fn table_identity_columns(&self) -> Vec<String> {
+        let Some(metadata) = self.table_metadata.as_ref() else {
+            return Vec::new();
+        };
+        let Some(page_columns) = self.table_page.as_ref().map(|page| &page.columns) else {
+            return Vec::new();
+        };
+        metadata
+            .indexes
+            .iter()
+            .filter(|index| index.is_primary && !index.columns.is_empty())
+            .find(|index| {
+                index.columns.iter().all(|index_column| {
+                    page_columns
+                        .iter()
+                        .any(|page_column| page_column.eq_ignore_ascii_case(index_column))
+                })
+            })
+            .or_else(|| {
+                metadata
+                    .indexes
+                    .iter()
+                    .filter(|index| index.is_unique && !index.columns.is_empty())
+                    .find(|index| {
+                        index.columns.iter().all(|index_column| {
+                            page_columns
+                                .iter()
+                                .any(|page_column| page_column.eq_ignore_ascii_case(index_column))
+                        })
+                    })
+            })
+            .map(|index| index.columns.clone())
+            .unwrap_or_default()
+    }
+
+    fn open_table_cell_editor(&mut self) {
+        let Some(row_index) = self.table_state.selected() else {
+            self.status = "No hay una fila seleccionada".to_owned();
+            return;
+        };
+        let Some((column, raw_value)) = self.table_page.as_ref().and_then(|page| {
+            let column = page.columns.get(self.table_column_index)?.clone();
+            let value = selected_table_value(page, Some(row_index), self.table_column_index)?;
+            Some((column, value))
+        }) else {
+            self.status = "No hay un valor seleccionado".to_owned();
+            return;
+        };
+        let Some(metadata) = self.table_metadata.as_ref().and_then(|table| {
+            table
+                .columns
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(&column))
+                .cloned()
+        }) else {
+            self.status = "La metadata es necesaria para editar esta celda".to_owned();
+            return;
+        };
+
+        let existing_draft = self.table_cell_drafts.iter().find(|draft| {
+            draft.row_index == row_index && draft.column.eq_ignore_ascii_case(&column)
+        });
+        let original_value = existing_draft
+            .map(|draft| draft.original_value.clone())
+            .unwrap_or_else(|| raw_value.clone());
+        let value = existing_draft
+            .map(|draft| draft.value.clone())
+            .unwrap_or(raw_value);
+        let data_type = format_table_type(&metadata);
+
+        if table_date_time_kind(&metadata.data_type).is_some() {
+            self.open_table_date_time_picker(row_index, column, value, metadata);
+            return;
+        }
+
+        self.table_cell_editor = Some(TableCellEditorSession {
+            column,
+            data_type,
+            row_number: row_index.saturating_add(1),
+            nullable: metadata.nullable,
+            original_value,
+            input: search_input(&value),
+            row_index,
+            metadata,
+        });
+        self.status = "Editando celda · Enter/Ctrl+S guarda borrador · Esc cancela".to_owned();
+    }
+
+    fn open_table_date_time_picker(
+        &mut self,
+        row_index: usize,
+        column: String,
+        value: String,
+        metadata: ColumnMetadata,
+    ) {
+        let Some(kind) = table_date_time_kind(&metadata.data_type) else {
+            return;
+        };
+        let picker_value = if value.trim().is_empty() {
+            if metadata.nullable {
+                "<NULL>".to_owned()
+            } else {
+                match kind {
+                    TableDateTimeKind::Date => "2000-01-01".to_owned(),
+                    TableDateTimeKind::DateTime => "2000-01-01 00:00:00".to_owned(),
+                    TableDateTimeKind::Time => "00:00:00".to_owned(),
+                }
+            }
+        } else {
+            value.clone()
+        };
+        let parsed = match parse_table_date_time_value(&picker_value, kind) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.status = format!("No se pudo abrir el picker: {error}");
+                return;
+            }
+        };
+        let original_value = self
+            .table_cell_drafts
+            .iter()
+            .find(|draft| {
+                draft.row_index == row_index && draft.column.eq_ignore_ascii_case(&column)
+            })
+            .map(|draft| draft.original_value.clone())
+            .unwrap_or_else(|| {
+                if value.trim().is_empty() {
+                    value.clone()
+                } else {
+                    format_parsed_table_date_time(&parsed, kind)
+                }
+            });
+
+        self.table_date_time_picker = Some(TableDateTimePickerSession {
+            column,
+            data_type: format_table_type(&metadata),
+            row_number: row_index.saturating_add(1),
+            nullable: metadata.nullable,
+            show_date: !matches!(kind, TableDateTimeKind::Time),
+            show_time: !matches!(kind, TableDateTimeKind::Date),
+            is_null: parsed.is_null,
+            selected_component: 0,
+            year: parsed.year,
+            month: parsed.month,
+            day: parsed.day,
+            hour: parsed.hour,
+            minute: parsed.minute,
+            second: parsed.second,
+            fractional_seconds: parsed.fractional_seconds,
+            original_value,
+            row_index,
+            metadata,
+        });
+        self.status =
+            "Picker date/hora · Tab cambia componente · ↑/↓ ajusta · Enter guarda · Esc cancela"
+                .to_owned();
+    }
+
+    fn handle_table_date_time_picker_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.table_date_time_picker = None;
+            self.status = "Picker date/hora cancelado".to_owned();
+            return;
+        }
+        if key.code == KeyCode::Enter {
+            self.commit_table_date_time_draft();
+            return;
+        }
+        if key.code == KeyCode::Char(' ') {
+            self.toggle_table_date_time_null();
+            return;
+        }
+        if key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+            || key.code == KeyCode::Left
+        {
+            self.move_table_date_time_component(-1);
+            return;
+        }
+        if key.code == KeyCode::Tab || key.code == KeyCode::Right {
+            self.move_table_date_time_component(1);
+            return;
+        }
+        if key.code == KeyCode::Up {
+            self.adjust_table_date_time_component(1);
+            return;
+        }
+        if key.code == KeyCode::Down {
+            self.adjust_table_date_time_component(-1);
+        }
+    }
+
+    fn move_table_date_time_component(&mut self, delta: isize) {
+        let Some(session) = self.table_date_time_picker.as_mut() else {
+            return;
+        };
+        let component_count = if session.show_date && session.show_time {
+            6
+        } else {
+            3
+        };
+        session.selected_component = if delta < 0 {
+            if session.selected_component == 0 {
+                component_count - 1
+            } else {
+                session.selected_component - 1
+            }
+        } else {
+            (session.selected_component + 1) % component_count
+        };
+    }
+
+    fn adjust_table_date_time_component(&mut self, delta: i32) {
+        let Some(session) = self.table_date_time_picker.as_mut() else {
+            return;
+        };
+        session.is_null = false;
+        let component = session.selected_component;
+        if session.show_date {
+            match component {
+                0 => session.year = stepped_clamped(session.year, 1, 9999, delta),
+                1 => session.month = stepped_wrapped(session.month, 1, 12, delta),
+                2 => {
+                    let max_day = days_in_month(session.year, session.month);
+                    session.day = stepped_clamped_u8(session.day, 1, max_day, delta);
+                }
+                3 => session.hour = stepped_wrapped(session.hour, 0, 23, delta),
+                4 => session.minute = stepped_wrapped(session.minute, 0, 59, delta),
+                5 => session.second = stepped_wrapped(session.second, 0, 59, delta),
+                _ => {}
+            }
+        } else {
+            match component {
+                0 => session.hour = stepped_wrapped(session.hour, 0, 23, delta),
+                1 => session.minute = stepped_wrapped(session.minute, 0, 59, delta),
+                2 => session.second = stepped_wrapped(session.second, 0, 59, delta),
+                _ => {}
+            }
+        }
+        let max_day = days_in_month(session.year, session.month);
+        session.day = session.day.min(max_day);
+    }
+
+    fn toggle_table_date_time_null(&mut self) {
+        let Some(session) = self.table_date_time_picker.as_mut() else {
+            return;
+        };
+        if !session.nullable {
+            self.status = "Esta columna no permite NULL".to_owned();
+            return;
+        }
+        session.is_null = !session.is_null;
+        self.status = if session.is_null {
+            "Valor NULL seleccionado · Space reactiva fecha/hora".to_owned()
+        } else {
+            "Fecha/hora activada · Enter guarda borrador".to_owned()
+        };
+    }
+
+    fn commit_table_date_time_draft(&mut self) {
+        let Some(session) = self.table_date_time_picker.as_ref() else {
+            return;
+        };
+        let value = format_table_date_time_picker(session);
+        if let Err(error) = validate_table_cell_value(&value, &session.metadata) {
+            self.status = format!("Valor inválido: {error}");
+            return;
+        }
+
+        let row_index = session.row_index;
+        let column = session.column.clone();
+        let original_value = session.original_value.clone();
+        let change = store_table_cell_draft(
+            &mut self.table_cell_drafts,
+            row_index,
+            column.clone(),
+            original_value,
+            value,
+        );
+        self.status = match change {
+            TableDraftChange::Reverted => format!("Borrador revertido: {column}"),
+            TableDraftChange::Updated => format!("Borrador actualizado: {column}"),
+            TableDraftChange::Saved => {
+                format!("Borrador date/hora guardado: {column} · todavía no se ejecuta SQL")
+            }
+        };
+        self.table_date_time_picker = None;
+    }
+
+    fn handle_table_cell_editor_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.table_cell_editor = None;
+            self.status = "Edición de celda cancelada".to_owned();
+            return;
+        }
+        if key.code == KeyCode::Enter
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s'))
+        {
+            self.commit_table_cell_draft();
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+            if let Some(session) = self.table_cell_editor.as_mut() {
+                session.input = TextArea::default();
+            }
+            return;
+        }
+
+        if let Some(session) = self.table_cell_editor.as_mut() {
+            match key.code {
+                KeyCode::Left => session.input.move_cursor(CursorMove::Back),
+                KeyCode::Right => session.input.move_cursor(CursorMove::Forward),
+                _ => {
+                    let input: Input = key.into();
+                    session.input.input_without_shortcuts(input);
+                }
+            }
+        }
+    }
+
+    fn commit_table_cell_draft(&mut self) {
+        let Some(session) = self.table_cell_editor.as_ref() else {
+            return;
+        };
+        let value = session.input.lines().join("\n");
+        if let Err(error) = validate_table_cell_value(&value, &session.metadata) {
+            self.status = format!("Valor inválido: {error}");
+            return;
+        }
+
+        let row_index = session.row_index;
+        let column = session.column.clone();
+        let original_value = session.original_value.clone();
+        let change = store_table_cell_draft(
+            &mut self.table_cell_drafts,
+            row_index,
+            column.clone(),
+            original_value,
+            value,
+        );
+        self.status = match change {
+            TableDraftChange::Reverted => format!("Borrador revertido: {column}"),
+            TableDraftChange::Updated => format!("Borrador actualizado: {column}"),
+            TableDraftChange::Saved => {
+                format!("Borrador guardado: {column} · todavía no se ejecuta SQL")
+            }
+        };
+        self.table_cell_editor = None;
+    }
+
+    fn clear_table_cell_editing(&mut self) {
+        self.table_cell_editor = None;
+        self.table_date_time_picker = None;
+        self.table_cell_drafts.clear();
+        self.table_row_deletions.clear();
+        self.table_new_rows.clear();
+        self.table_changes_summary = None;
+        self.table_changes_summary_scroll = 0;
+        self.table_sql_preview = None;
+        self.table_sql_preview_scroll = 0;
+        self.table_row_visual_anchor = None;
+        self.table_delete_sequence_armed = false;
+    }
+
+    fn has_pending_table_changes(&self) -> bool {
+        !self.table_cell_drafts.is_empty()
+            || !self.table_row_deletions.is_empty()
+            || !self.table_new_rows.is_empty()
+    }
+
+    fn request_table_exit(&mut self) {
+        self.table_delete_sequence_armed = false;
+        if !self.has_pending_table_changes() {
+            self.exit_table_mode();
+            return;
+        }
+
+        self.confirm_action = Some(ConfirmAction::DiscardTableChanges);
+        self.confirm_message = table_exit_message(
+            self.table_cell_drafts.len(),
+            self.table_row_deletions.len(),
+            self.table_new_rows.len(),
+        );
+        self.mode = AppMode::Confirm;
+    }
+
+    fn exit_table_mode(&mut self) {
+        self.table_page = None;
+        self.table_metadata = None;
+        self.table_show_metadata = false;
+        self.table_visual_anchor = None;
+        self.table_row_visual_anchor = None;
+        self.table_copy_stage = None;
+        self.table_copy_source = None;
+        self.sort_session = None;
+        self.column_search_session = None;
+        self.clear_table_cell_editing();
+        self.table_row_deletions.clear();
+        self.table_new_rows.clear();
+        self.table_delete_sequence_armed = false;
+        self.table_value_modal = None;
+        self.table_value_scroll = 0;
+        self.pending_table_navigation = None;
+        self.mode = AppMode::Browser;
+    }
+
     fn update_visual_status(&mut self, visual: bool) {
-        if visual {
+        if self.table_row_visual_anchor.is_some() {
+            self.status =
+                "Selección de filas activa · mueve el cursor · y copia · Esc cancela".to_owned();
+        } else if visual {
             self.status = "Selección visual activa · y copia · Esc cancela".to_owned();
         }
+    }
+
+    fn selected_table_row_range(&self) -> Option<(usize, usize)> {
+        let row_count = self.table_page.as_ref()?.rows.len();
+        if row_count == 0 {
+            return None;
+        }
+        let current = self.table_state.selected()?.min(row_count - 1);
+        let anchor = self
+            .table_row_visual_anchor
+            .unwrap_or(current)
+            .min(row_count - 1);
+        Some((anchor.min(current), anchor.max(current)))
+    }
+
+    fn mark_selected_rows_for_delete(&mut self) {
+        let Some((start, end)) = self.selected_table_row_range() else {
+            self.status = "No hay filas para marcar".to_owned();
+            return;
+        };
+        for row_index in start..=end {
+            self.table_row_deletions.insert(row_index);
+        }
+        self.table_row_visual_anchor = None;
+        let count = end - start + 1;
+        self.status = format!(
+            "{} {} marcada(s) para borrar · u deshace · todavía no se ejecuta SQL",
+            count,
+            if count == 1 { "fila" } else { "filas" }
+        );
+    }
+
+    fn unmark_selected_rows_for_delete(&mut self) {
+        let Some((start, end)) = self.selected_table_row_range() else {
+            self.status = "No hay filas para desmarcar".to_owned();
+            return;
+        };
+        let mut count = 0;
+        for row_index in start..=end {
+            count += usize::from(self.table_row_deletions.remove(&row_index));
+        }
+        self.status = if count == 0 {
+            "No había filas marcadas para borrar".to_owned()
+        } else {
+            format!(
+                "{} {} desmarcada(s)",
+                count,
+                if count == 1 { "fila" } else { "filas" }
+            )
+        };
+    }
+
+    fn copy_current_row_and_mark_for_delete(&mut self) {
+        let Some(row_index) = self.table_state.selected() else {
+            self.status = "No hay una fila seleccionada para dd".to_owned();
+            return;
+        };
+        let Some(page) = self.table_page.clone() else {
+            self.status = "No hay datos cargados para dd".to_owned();
+            return;
+        };
+        let Some(text) = table_copy_rows_text(&page, Some(row_index), Some(row_index), false)
+        else {
+            self.status = "No se pudo copiar la fila para dd".to_owned();
+            return;
+        };
+        self.table_row_deletions.insert(row_index);
+        self.status = match services::clipboard::copy_text(&text) {
+            Ok(()) => "Fila copiada y marcada para borrar · todavía no se ejecuta SQL".to_owned(),
+            Err(error) => format!("Fila marcada para borrar, pero no se pudo copiar: {error}"),
+        };
+    }
+
+    fn table_row_values_with_drafts(&self, row_index: usize) -> Option<Vec<String>> {
+        let page = self.table_page.as_ref()?;
+        let values = page.rows.get(row_index)?;
+        Some(
+            page.columns
+                .iter()
+                .enumerate()
+                .map(|(column_index, column)| {
+                    self.table_cell_draft_value(row_index, column)
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| values.get(column_index).cloned().unwrap_or_default())
+                })
+                .collect(),
+        )
+    }
+
+    fn append_table_new_row(&mut self, clone_current: bool) {
+        if self.table_metadata.is_none() {
+            self.status = "La metadata es necesaria para crear filas".to_owned();
+            return;
+        }
+        let values = if clone_current {
+            let Some(row_index) = self.table_state.selected() else {
+                self.status = "No hay una fila seleccionada para clonar".to_owned();
+                return;
+            };
+            let Some(values) = self.table_row_values_with_drafts(row_index) else {
+                self.status = "No se pudo clonar la fila seleccionada".to_owned();
+                return;
+            };
+            values
+        } else {
+            let Some(column_count) = self.table_page.as_ref().map(|page| page.columns.len()) else {
+                self.status = "No hay una tabla cargada".to_owned();
+                return;
+            };
+            if column_count == 0 {
+                self.status = "La tabla no tiene columnas".to_owned();
+                return;
+            }
+            vec![String::new(); column_count]
+        };
+        let Some(page) = self.table_page.as_mut() else {
+            self.status = "No hay una tabla cargada".to_owned();
+            return;
+        };
+        let row_index = page.rows.len();
+        page.rows.push(values);
+        self.table_new_rows.insert(row_index);
+        self.table_state.select(Some(row_index));
+        self.table_visual_anchor = None;
+        self.table_row_visual_anchor = None;
+        self.table_delete_sequence_armed = false;
+        self.status = if clone_current {
+            "Fila clonada como borrador nuevo · usa e para editar".to_owned()
+        } else {
+            "Fila nueva creada como borrador · usa e para editar".to_owned()
+        };
+    }
+
+    fn undo_table_row_change(&mut self) {
+        let Some(row_index) = self.table_state.selected() else {
+            self.status = "No hay una fila seleccionada".to_owned();
+            return;
+        };
+        if self.table_new_rows.contains(&row_index) {
+            self.discard_new_row(row_index);
+        } else {
+            self.unmark_selected_rows_for_delete();
+        }
+    }
+
+    fn discard_new_row(&mut self, row_index: usize) {
+        if !self.table_new_rows.contains(&row_index) {
+            self.status = "La fila seleccionada no es un borrador nuevo".to_owned();
+            return;
+        }
+        let Some(page) = self.table_page.as_mut() else {
+            return;
+        };
+        if row_index >= page.rows.len() {
+            return;
+        }
+        page.rows.remove(row_index);
+        self.table_new_rows = shift_row_indexes(&self.table_new_rows, row_index);
+        self.table_row_deletions = shift_row_indexes(&self.table_row_deletions, row_index);
+        self.table_cell_drafts
+            .retain(|draft| draft.row_index != row_index);
+        for draft in &mut self.table_cell_drafts {
+            if draft.row_index > row_index {
+                draft.row_index -= 1;
+            }
+        }
+        let next_row = self
+            .table_page
+            .as_ref()
+            .and_then(|page| (!page.rows.is_empty()).then_some(row_index.min(page.rows.len() - 1)));
+        self.table_state.select(next_row);
+        self.table_visual_anchor = None;
+        self.table_row_visual_anchor = None;
+        self.table_delete_sequence_armed = false;
+        self.status = "Fila nueva descartada".to_owned();
     }
 
     fn open_table_filter(&mut self) {
@@ -1232,6 +2312,7 @@ impl App {
         let page = self.apply_table_preferences_to_page(page);
         self.table_page = Some(page);
         self.table_visual_anchor = None;
+        self.table_row_visual_anchor = None;
         let selected_index = selected_column.as_deref().and_then(|column| {
             self.table_page.as_ref().and_then(|page| {
                 page.columns
@@ -1282,6 +2363,11 @@ impl App {
 
     fn reset_table_page(&mut self) {
         self.table_query.page.cursor = None;
+        self.clear_table_cell_editing();
+        self.table_row_deletions.clear();
+        self.table_new_rows.clear();
+        self.table_delete_sequence_armed = false;
+        self.table_row_visual_anchor = None;
         self.table_page = None;
         self.table_state = TableState::default();
         self.table_column_index = 0;
@@ -1392,20 +2478,29 @@ impl App {
         let column = self
             .table_column_index
             .min(page.columns.len().saturating_sub(1));
-        let text = table_copy_text(
-            &page,
-            source,
-            self.table_state.selected(),
-            column,
-            self.table_visual_anchor,
-            include_header,
-        );
+        let text = match source {
+            TableCopySource::VisualRows => table_copy_rows_text(
+                &page,
+                self.table_row_visual_anchor,
+                self.table_state.selected(),
+                include_header,
+            ),
+            _ => table_copy_text(
+                &page,
+                source,
+                self.table_state.selected(),
+                column,
+                self.table_visual_anchor,
+                include_header,
+            ),
+        };
         let Some(text) = text else {
             self.status = match source {
                 TableCopySource::CurrentCell | TableCopySource::CurrentRow => {
                     "No hay una fila seleccionada".to_owned()
                 }
                 TableCopySource::VisualSelection => "No hay una selección visual activa".to_owned(),
+                TableCopySource::VisualRows => "No hay una selección de filas activa".to_owned(),
                 _ => "No hay datos cargados para copiar".to_owned(),
             };
             return;
@@ -1416,9 +2511,11 @@ impl App {
             TableCopySource::CurrentRow => "Fila copiada",
             TableCopySource::CurrentColumn => "Columna copiada",
             TableCopySource::VisualSelection => "Selección copiada",
+            TableCopySource::VisualRows => "Filas seleccionadas copiadas",
         };
         self.copy_text(text, label);
         self.table_visual_anchor = None;
+        self.table_row_visual_anchor = None;
         self.table_copy_stage = None;
         self.table_copy_source = None;
     }
@@ -1433,7 +2530,7 @@ impl App {
         if key.code == KeyCode::Esc {
             self.flush_search_refresh();
             self.search = None;
-            self.mode = AppMode::Browser;
+            self.mode = self.search_return_mode;
             return;
         }
 
@@ -1458,14 +2555,15 @@ impl App {
         if key.code == KeyCode::Enter {
             self.flush_search_refresh();
             let Some(session) = self.search.take() else {
-                self.mode = AppMode::Browser;
+                self.mode = self.search_return_mode;
                 return;
             };
 
             let query = session.input.lines().join("\n").trim().to_owned();
-            self.mode = AppMode::Browser;
+            let return_mode = self.search_return_mode;
 
             if query.is_empty() {
+                self.mode = return_mode;
                 return;
             }
 
@@ -1475,8 +2573,21 @@ impl App {
                 .get(session.selected_suggestion)
                 .cloned()
             {
+                if return_mode == AppMode::Table && self.has_pending_table_changes() {
+                    self.pending_table_navigation = Some(entry);
+                    self.confirm_action = Some(ConfirmAction::DiscardTableChanges);
+                    self.confirm_message = table_exit_message(
+                        self.table_cell_drafts.len(),
+                        self.table_row_deletions.len(),
+                        self.table_new_rows.len(),
+                    );
+                    self.mode = AppMode::Confirm;
+                    return;
+                }
+                self.mode = AppMode::Browser;
                 self.navigate_to_catalog_entry(entry);
             } else {
+                self.mode = return_mode;
                 self.status = "No hay coincidencias en el catálogo".to_owned();
             }
             return;
@@ -1736,17 +2847,40 @@ impl App {
                 };
                 match action {
                     ConfirmAction::Execute { sql } => self.dispatch_execute(sql),
+                    ConfirmAction::ExecuteTableChanges { sql } => self.dispatch_table_changes(sql),
                     ConfirmAction::DiscardEditor => {
                         self.editor = None;
                         self.mode = AppMode::Browser;
                         self.status = "Cambios descartados".to_owned();
                     }
+                    ConfirmAction::DiscardTableChanges => {
+                        let navigation = self.pending_table_navigation.take();
+                        self.exit_table_mode();
+                        if let Some(entry) = navigation {
+                            self.navigate_to_catalog_entry(entry);
+                        } else {
+                            self.status = "Cambios de tabla descartados".to_owned();
+                        }
+                    }
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                let return_to_table = self.confirm_action.as_ref().is_some_and(|action| {
+                    matches!(
+                        action,
+                        ConfirmAction::DiscardTableChanges
+                            | ConfirmAction::ExecuteTableChanges { .. }
+                    )
+                });
                 self.confirm_action = None;
                 self.return_to_editor_after_execution = false;
-                self.mode = if self.editor.is_some() {
+                self.return_to_table_after_execution = false;
+                if return_to_table {
+                    self.pending_table_navigation = None;
+                }
+                self.mode = if return_to_table {
+                    AppMode::Table
+                } else if self.editor.is_some() {
                     AppMode::Editor
                 } else {
                     AppMode::Browser
@@ -1948,6 +3082,7 @@ impl App {
             return;
         };
         let request_id = self.begin_request(format!("Consultando {}...", object.qualified_name()));
+        self.clear_table_cell_editing();
         self.table_metadata = None;
         self.table_page = None;
         self.table_query = TableQuery::new(PageRequest::default());
@@ -1975,6 +3110,7 @@ impl App {
             return;
         };
         let request_id = self.begin_request(format!("Consultando {}...", object.qualified_name()));
+        self.clear_table_cell_editing();
         self.table_query = TableQuery::default();
         self.sort_session = None;
         self.column_search_session = None;
@@ -2170,6 +3306,7 @@ impl App {
     }
 
     fn dispatch_execute(&mut self, sql: String) {
+        self.return_to_table_after_execution = false;
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
@@ -2191,6 +3328,96 @@ impl App {
         } else {
             AppMode::Browser
         };
+    }
+
+    fn dispatch_table_changes(&mut self, sql: String) {
+        if !self
+            .current_profile()
+            .is_some_and(|profile| profile.allow_writes)
+        {
+            self.status =
+                "Escritura bloqueada: cambia allow_writes = true para esta conexión".to_owned();
+            self.mode = AppMode::Table;
+            return;
+        }
+        if !contains_executable_table_sql(&sql) {
+            self.status = "Ejecución bloqueada: no hay SQL ejecutable".to_owned();
+            self.mode = AppMode::Table;
+            return;
+        }
+        let Some(profile) = self.current_profile().cloned() else {
+            self.status = "No hay una conexión seleccionada".to_owned();
+            self.mode = AppMode::Table;
+            return;
+        };
+        let connection_index = self.connection_index;
+        let database = self
+            .active_database()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| profile.initial_database().to_owned());
+        let request_id = self.begin_request(format!("Ejecutando cambios staged en {database}..."));
+        let request = WorkerRequest::ExecuteSql {
+            request_id,
+            connection_index,
+            database,
+            sql,
+            profile,
+        };
+        self.return_to_table_after_execution = true;
+        if let Err(error) = self.request_tx.send(request) {
+            self.pending_requests.remove(&request_id);
+            self.busy_count = self.pending_requests.len();
+            self.return_to_table_after_execution = false;
+            self.status = format!("ERROR: el worker de base de datos terminó: {error}");
+            self.mode = AppMode::Table;
+        } else {
+            self.mode = AppMode::Table;
+        }
+    }
+
+    fn handle_table_changes_execution_result(
+        &mut self,
+        database: String,
+        result: Result<SqlOutput, String>,
+    ) {
+        match result {
+            Ok(output) => {
+                let content = output.combined();
+                let committed = table_execution_committed(&output);
+                self.content_title = format!("Resultado · {database}");
+                self.content_scroll = 0;
+                self.content = content.clone();
+                self.highlighted_content = None;
+                if committed {
+                    self.reset_table_page();
+                    self.table_show_metadata = false;
+                    self.mode = AppMode::Table;
+                    self.status =
+                        "Cambios ejecutados y confirmados · recargando tabla...".to_owned();
+                    self.load_table_query_page("Recargando tabla después del commit...");
+                } else {
+                    self.mode = AppMode::Table;
+                    self.status = if table_execution_rolled_back(&output) {
+                        "Transacción revertida · los cambios staged se conservaron".to_owned()
+                    } else if output.success {
+                        "No se confirmó el commit · los cambios staged se conservaron".to_owned()
+                    } else {
+                        "ASE/isql devolvió un error · los cambios staged se conservaron".to_owned()
+                    };
+                }
+            }
+            Err(error) => {
+                self.content_title = "Error de ejecución".to_owned();
+                self.content_scroll = 0;
+                self.content = error.clone();
+                self.highlighted_content = None;
+                self.mode = AppMode::Table;
+                self.status = format!(
+                    "ERROR: {} · los cambios staged se conservaron",
+                    first_line(&error)
+                );
+            }
+        }
     }
 
     fn handle_worker_response(&mut self, response: WorkerResponse) {
@@ -2276,6 +3503,7 @@ impl App {
                         self.highlighted_content = None;
                         self.table_page = None;
                         self.table_metadata = None;
+                        self.clear_table_cell_editing();
                         self.table_filter_expression.clear();
                         self.filter_session = None;
                         self.sort_session = None;
@@ -2318,6 +3546,7 @@ impl App {
                         self.highlighted_content = Some(ui::highlight_sql(&definition));
                         self.table_page = None;
                         self.table_metadata = None;
+                        self.clear_table_cell_editing();
                         self.table_filter_expression.clear();
                         self.filter_session = None;
                         self.sort_session = None;
@@ -2362,6 +3591,7 @@ impl App {
                                 }
                             };
                         let page = self.apply_table_preferences_to_page(page);
+                        self.clear_table_cell_editing();
                         self.content_title = format!("Datos · {}", object.qualified_name());
                         self.content_scroll = 0;
                         self.horizontal_scroll = ScrollbarState::new(page.columns.len());
@@ -2451,6 +3681,7 @@ impl App {
                             current_page.has_more = page.has_more;
                             current_page.total_rows = page.total_rows;
                         } else {
+                            self.clear_table_cell_editing();
                             self.horizontal_scroll = ScrollbarState::new(page.columns.len());
                             self.table_state = TableState::default();
                             self.table_column_index = 0;
@@ -2495,6 +3726,12 @@ impl App {
                 if self.connection_index != connection_index
                     || self.active_database() != Some(database.as_str())
                 {
+                    return;
+                }
+                if self.return_to_table_after_execution {
+                    self.handle_table_changes_execution_result(database, result);
+                    self.return_to_table_after_execution = false;
+                    self.busy_count = self.pending_requests.len();
                     return;
                 }
                 match result {
@@ -2597,6 +3834,11 @@ impl App {
         self.table_page = None;
         self.table_metadata = None;
         self.table_show_metadata = false;
+        self.clear_table_cell_editing();
+        self.table_row_deletions.clear();
+        self.table_new_rows.clear();
+        self.table_row_visual_anchor = None;
+        self.table_delete_sequence_armed = false;
         self.sort_session = None;
         self.column_search_session = None;
         self.content_title = "Error".to_owned();
@@ -2656,6 +3898,17 @@ fn reorder_table_page(page: TablePage, pinned_columns: &[String]) -> TablePage {
         total_rows,
     )
     .expect("reordered table page preserves row widths")
+}
+
+fn selected_table_value(
+    page: &TablePage,
+    selected_row: Option<usize>,
+    selected_column: usize,
+) -> Option<String> {
+    page.rows
+        .get(selected_row?)
+        .and_then(|row| row.get(selected_column))
+        .cloned()
 }
 
 fn search_input(text: &str) -> TextArea<'static> {
@@ -2982,6 +4235,31 @@ fn is_write_sql(sql: &str) -> bool {
         .any(|word| WRITE_WORDS.contains(&word))
 }
 
+fn contains_executable_table_sql(sql: &str) -> bool {
+    sql.lines().any(|line| {
+        let code = line.split_once("--").map_or(line, |(code, _)| code);
+        let Some(keyword) = code.split_whitespace().next() else {
+            return false;
+        };
+        ["update", "delete", "insert"]
+            .iter()
+            .any(|expected| keyword.eq_ignore_ascii_case(expected))
+    })
+}
+
+fn table_execution_committed(output: &SqlOutput) -> bool {
+    output.success
+        && output
+            .combined()
+            .contains(sybase::queries::staged_committed_marker())
+}
+
+fn table_execution_rolled_back(output: &SqlOutput) -> bool {
+    output
+        .combined()
+        .contains(sybase::queries::staged_rolled_back_marker())
+}
+
 fn format_key(key: KeyEvent) -> String {
     let mut parts = Vec::new();
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3002,7 +4280,7 @@ fn format_key(key: KeyEvent) -> String {
     parts.join("+")
 }
 
-fn format_table_type(column: &crate::db::models::ColumnMetadata) -> String {
+fn format_table_type(column: &ColumnMetadata) -> String {
     match column.data_type.to_ascii_lowercase().as_str() {
         "char" | "varchar" | "nchar" | "nvarchar" | "binary" | "varbinary" | "unichar"
         | "univarchar" => column.length.map_or_else(
@@ -3017,6 +4295,543 @@ fn format_table_type(column: &crate::db::models::ColumnMetadata) -> String {
         },
         _ => column.data_type.clone(),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableDraftChange {
+    Saved,
+    Updated,
+    Reverted,
+}
+
+fn store_table_cell_draft(
+    drafts: &mut Vec<TableCellDraft>,
+    row_index: usize,
+    column: String,
+    original_value: String,
+    value: String,
+) -> TableDraftChange {
+    let draft_index = drafts.iter().position(|draft| {
+        draft.row_index == row_index && draft.column.eq_ignore_ascii_case(&column)
+    });
+    if value == original_value {
+        if let Some(index) = draft_index {
+            drafts.remove(index);
+        }
+        return TableDraftChange::Reverted;
+    }
+    if let Some(index) = draft_index {
+        drafts[index].value = value;
+        TableDraftChange::Updated
+    } else {
+        drafts.push(TableCellDraft {
+            row_index,
+            column,
+            original_value,
+            value,
+        });
+        TableDraftChange::Saved
+    }
+}
+
+fn table_draft_exit_message(count: usize) -> String {
+    let noun = if count == 1 { "borrador" } else { "borradores" };
+    format!("Hay {count} {noun} sin guardar. ¿Salir y descartarlos? [y/N]")
+}
+
+fn compact_table_summary_value(value: &str) -> String {
+    let value = value.replace(['\r', '\n'], "↵");
+    if value.is_empty() {
+        return "<vacío>".to_owned();
+    }
+    let mut shortened = value.chars().take(36).collect::<String>();
+    if shortened.chars().count() < value.chars().count() {
+        shortened.push('…');
+    }
+    shortened
+}
+
+fn table_exit_message(draft_count: usize, deletion_count: usize, new_row_count: usize) -> String {
+    match (draft_count, deletion_count, new_row_count) {
+        (drafts, 0, 0) => table_draft_exit_message(drafts),
+        (0, deletions, 0) => {
+            let noun = if deletions == 1 {
+                "fila marcada"
+            } else {
+                "filas marcadas"
+            };
+            let pronoun = if deletions == 1 {
+                "descartarla"
+            } else {
+                "descartarlas"
+            };
+            format!("Hay {deletions} {noun} para borrar sin guardar. ¿Salir y {pronoun}? [y/N]")
+        }
+        (drafts, deletions, 0) => {
+            let draft_noun = if drafts == 1 {
+                "borrador"
+            } else {
+                "borradores"
+            };
+            let row_noun = if deletions == 1 {
+                "fila marcada"
+            } else {
+                "filas marcadas"
+            };
+            format!(
+                "Hay {drafts} {draft_noun} y {deletions} {row_noun} para borrar sin guardar. ¿Salir y descartar los cambios? [y/N]"
+            )
+        }
+        (0, 0, new_rows) => {
+            let noun = if new_rows == 1 {
+                "fila nueva"
+            } else {
+                "filas nuevas"
+            };
+            let pronoun = if new_rows == 1 {
+                "descartarla"
+            } else {
+                "descartarlas"
+            };
+            format!("Hay {new_rows} {noun} sin guardar. ¿Salir y {pronoun}? [y/N]")
+        }
+        (drafts, deletions, new_rows) => {
+            let draft_noun = if drafts == 1 {
+                "borrador"
+            } else {
+                "borradores"
+            };
+            let row_noun = if deletions == 1 {
+                "fila marcada"
+            } else {
+                "filas marcadas"
+            };
+            let new_row_label = if new_rows == 1 {
+                "1 fila nueva".to_owned()
+            } else {
+                format!("{new_rows} filas nuevas")
+            };
+            format!(
+                "Hay {drafts} {draft_noun}, {deletions} {row_noun} y {new_row_label} sin guardar. ¿Salir y descartar los cambios? [y/N]"
+            )
+        }
+    }
+}
+
+fn table_date_time_kind(data_type: &str) -> Option<TableDateTimeKind> {
+    match data_type.to_ascii_lowercase().as_str() {
+        "date" => Some(TableDateTimeKind::Date),
+        "datetime" | "smalldatetime" => Some(TableDateTimeKind::DateTime),
+        "time" => Some(TableDateTimeKind::Time),
+        _ => None,
+    }
+}
+
+fn is_table_null_marker(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "null" | "<null>"
+    )
+}
+
+fn parse_table_date_time_value(
+    value: &str,
+    kind: TableDateTimeKind,
+) -> Result<ParsedTableDateTime, String> {
+    if is_table_null_marker(value) {
+        return Ok(ParsedTableDateTime {
+            year: 2000,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            fractional_seconds: String::new(),
+            is_null: true,
+        });
+    }
+
+    let value = value.trim();
+    match kind {
+        TableDateTimeKind::Date => {
+            let (year, month, day) = parse_date_expression(value)?;
+            Ok(ParsedTableDateTime {
+                year,
+                month,
+                day,
+                hour: 0,
+                minute: 0,
+                second: 0,
+                fractional_seconds: String::new(),
+                is_null: false,
+            })
+        }
+        TableDateTimeKind::DateTime => {
+            let parts = value.replace('T', " ");
+            let tokens = parts.split_whitespace().collect::<Vec<_>>();
+            let (year, month, day, time_token) = if tokens
+                .first()
+                .is_some_and(|token| token.contains('-') || token.contains('/'))
+            {
+                let (year, month, day) = parse_numeric_date_token(tokens[0])?;
+                (year, month, day, tokens.get(1).copied())
+            } else if tokens.len() >= 3 {
+                let month = parse_month_token(tokens[0])?;
+                let day = tokens[1]
+                    .parse::<u8>()
+                    .map_err(|_| "el día no es válido".to_owned())?;
+                let year = tokens[2]
+                    .parse::<u16>()
+                    .map_err(|_| "el año no es válido".to_owned())?;
+                validate_date(year, month, day)?;
+                (year, month, day, tokens.get(3).copied())
+            } else {
+                return Err("usa YYYY-MM-DD HH:MM:SS".to_owned());
+            };
+            let (hour, minute, second, fractional_seconds) = time_token
+                .map(parse_time_token)
+                .transpose()?
+                .unwrap_or((0, 0, 0, String::new()));
+            Ok(ParsedTableDateTime {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                fractional_seconds,
+                is_null: false,
+            })
+        }
+        TableDateTimeKind::Time => {
+            let (hour, minute, second, fractional_seconds) = parse_time_token(value)?;
+            Ok(ParsedTableDateTime {
+                year: 2000,
+                month: 1,
+                day: 1,
+                hour,
+                minute,
+                second,
+                fractional_seconds,
+                is_null: false,
+            })
+        }
+    }
+}
+
+fn parse_date_expression(value: &str) -> Result<(u16, u8, u8), String> {
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    if let Some(token) = tokens.first()
+        && (token.contains('-') || token.contains('/'))
+    {
+        return parse_numeric_date_token(token);
+    }
+    if tokens.len() < 3 {
+        return Err("usa YYYY-MM-DD".to_owned());
+    }
+    let month = parse_month_token(tokens[0])?;
+    let day = tokens[1]
+        .parse::<u8>()
+        .map_err(|_| "el día no es válido".to_owned())?;
+    let year = tokens[2]
+        .parse::<u16>()
+        .map_err(|_| "el año no es válido".to_owned())?;
+    validate_date(year, month, day)?;
+    Ok((year, month, day))
+}
+
+fn parse_numeric_date_token(value: &str) -> Result<(u16, u8, u8), String> {
+    let parts = value.split(|character| character == '-' || character == '/');
+    let parts = parts.collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err("usa YYYY-MM-DD".to_owned());
+    }
+    let year = parts[0]
+        .parse::<u16>()
+        .map_err(|_| "el año no es válido".to_owned())?;
+    let month = parts[1]
+        .parse::<u8>()
+        .map_err(|_| "el mes no es válido".to_owned())?;
+    let day = parts[2]
+        .parse::<u8>()
+        .map_err(|_| "el día no es válido".to_owned())?;
+    validate_date(year, month, day)?;
+    Ok((year, month, day))
+}
+
+fn parse_month_token(value: &str) -> Result<u8, String> {
+    let month = match value.to_ascii_lowercase().as_str() {
+        "1" | "01" | "jan" | "january" => 1,
+        "2" | "02" | "feb" | "february" => 2,
+        "3" | "03" | "mar" | "march" => 3,
+        "4" | "04" | "apr" | "april" => 4,
+        "5" | "05" | "may" => 5,
+        "6" | "06" | "jun" | "june" => 6,
+        "7" | "07" | "jul" | "july" => 7,
+        "8" | "08" | "aug" | "august" => 8,
+        "9" | "09" | "sep" | "september" => 9,
+        "10" | "oct" | "october" => 10,
+        "11" | "nov" | "november" => 11,
+        "12" | "dec" | "december" => 12,
+        _ => return Err("el mes no es válido".to_owned()),
+    };
+    Ok(month)
+}
+
+fn parse_time_token(value: &str) -> Result<(u8, u8, u8, String), String> {
+    let value = value.trim();
+    let upper = value.to_ascii_uppercase();
+    let meridiem = if upper.ends_with("AM") {
+        Some(false)
+    } else if upper.ends_with("PM") {
+        Some(true)
+    } else {
+        None
+    };
+    let clock = meridiem.map_or(value, |_| &value[..value.len().saturating_sub(2)]);
+    let (clock, fractional_seconds) = clock
+        .split_once('.')
+        .map_or((clock, ""), |(clock, fraction)| (clock, fraction));
+    if !fractional_seconds
+        .chars()
+        .all(|character| character.is_ascii_digit())
+    {
+        return Err("los milisegundos no son válidos".to_owned());
+    }
+    let parts = clock.split(':').collect::<Vec<_>>();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err("usa HH:MM o HH:MM:SS".to_owned());
+    }
+    let mut hour = parts[0]
+        .parse::<u8>()
+        .map_err(|_| "la hora no es válida".to_owned())?;
+    let minute = parts[1]
+        .parse::<u8>()
+        .map_err(|_| "los minutos no son válidos".to_owned())?;
+    let second = parts
+        .get(2)
+        .map_or(Ok(0), |part| part.parse::<u8>())
+        .map_err(|_| "los segundos no son válidos".to_owned())?;
+    if minute > 59 || second > 59 {
+        return Err("minutos y segundos deben estar entre 0 y 59".to_owned());
+    }
+    if let Some(is_pm) = meridiem {
+        if !(1..=12).contains(&hour) {
+            return Err("la hora AM/PM debe estar entre 1 y 12".to_owned());
+        }
+        hour = if hour == 12 { 0 } else { hour };
+        if is_pm {
+            hour = hour.saturating_add(12);
+        }
+    } else if hour > 23 {
+        return Err("la hora debe estar entre 0 y 23".to_owned());
+    }
+    Ok((hour, minute, second, fractional_seconds.to_owned()))
+}
+
+fn validate_date(year: u16, month: u8, day: u8) -> Result<(), String> {
+    if !(1..=12).contains(&month) {
+        return Err("el mes debe estar entre 1 y 12".to_owned());
+    }
+    if !(1..=days_in_month(year, month)).contains(&day) {
+        return Err("el día no es válido para ese mes".to_owned());
+    }
+    Ok(())
+}
+
+fn is_leap_year(year: u16) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn stepped_clamped(value: u16, minimum: u16, maximum: u16, delta: i32) -> u16 {
+    if delta < 0 {
+        value
+            .saturating_sub(delta.unsigned_abs() as u16)
+            .max(minimum)
+    } else {
+        value.saturating_add(delta as u16).min(maximum)
+    }
+}
+
+fn stepped_clamped_u8(value: u8, minimum: u8, maximum: u8, delta: i32) -> u8 {
+    if delta < 0 {
+        value
+            .saturating_sub(delta.unsigned_abs() as u8)
+            .max(minimum)
+    } else {
+        value.saturating_add(delta as u8).min(maximum)
+    }
+}
+
+fn stepped_wrapped(value: u8, minimum: u8, maximum: u8, delta: i32) -> u8 {
+    if delta < 0 {
+        if value <= minimum { maximum } else { value - 1 }
+    } else if value >= maximum {
+        minimum
+    } else {
+        value + 1
+    }
+}
+
+fn format_parsed_table_date_time(value: &ParsedTableDateTime, kind: TableDateTimeKind) -> String {
+    if value.is_null {
+        return "<NULL>".to_owned();
+    }
+    let date = format!("{:04}-{:02}-{:02}", value.year, value.month, value.day);
+    let time = if value.fractional_seconds.is_empty() {
+        format!("{:02}:{:02}:{:02}", value.hour, value.minute, value.second)
+    } else {
+        format!(
+            "{:02}:{:02}:{:02}.{}",
+            value.hour, value.minute, value.second, value.fractional_seconds
+        )
+    };
+    match kind {
+        TableDateTimeKind::Date => date,
+        TableDateTimeKind::DateTime => format!("{date} {time}"),
+        TableDateTimeKind::Time => time,
+    }
+}
+
+fn format_table_date_time_picker(session: &TableDateTimePickerSession) -> String {
+    format_parsed_table_date_time(
+        &ParsedTableDateTime {
+            year: session.year,
+            month: session.month,
+            day: session.day,
+            hour: session.hour,
+            minute: session.minute,
+            second: session.second,
+            fractional_seconds: session.fractional_seconds.clone(),
+            is_null: session.is_null,
+        },
+        if session.show_date && session.show_time {
+            TableDateTimeKind::DateTime
+        } else if session.show_date {
+            TableDateTimeKind::Date
+        } else {
+            TableDateTimeKind::Time
+        },
+    )
+}
+
+fn validate_table_cell_value(value: &str, column: &ColumnMetadata) -> Result<(), String> {
+    let trimmed = value.trim();
+    if is_table_null_marker(trimmed) {
+        return if column.nullable {
+            Ok(())
+        } else {
+            Err("la columna no permite NULL".to_owned())
+        };
+    }
+
+    let data_type = column.data_type.to_ascii_lowercase();
+    match data_type.as_str() {
+        "tinyint" | "smallint" | "int" | "integer" | "bigint" => trimmed
+            .parse::<i128>()
+            .map(|_| ())
+            .map_err(|_| format!("{data_type} requiere un entero")),
+        "numeric" | "decimal" => validate_decimal_value(trimmed, column),
+        "float" | "real" | "double" | "double precision" => trimmed
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
+            .map(|_| ())
+            .ok_or_else(|| format!("{data_type} requiere un número válido")),
+        "date" => parse_table_date_time_value(trimmed, TableDateTimeKind::Date)
+            .map(|_| ())
+            .map_err(|error| format!("date inválido: {error}")),
+        "datetime" | "smalldatetime" => {
+            parse_table_date_time_value(trimmed, TableDateTimeKind::DateTime)
+                .map(|_| ())
+                .map_err(|error| format!("datetime inválido: {error}"))
+        }
+        "time" => parse_table_date_time_value(trimmed, TableDateTimeKind::Time)
+            .map(|_| ())
+            .map_err(|error| format!("time inválido: {error}")),
+        "bit" => {
+            if matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "0" | "1" | "true" | "false"
+            ) {
+                Ok(())
+            } else {
+                Err("bit requiere 0, 1, true o false".to_owned())
+            }
+        }
+        "char" | "varchar" | "nchar" | "nvarchar" | "binary" | "varbinary" | "unichar"
+        | "univarchar" => validate_text_length(value, column),
+        "money" | "smallmoney" => validate_decimal_syntax(trimmed)
+            .map_err(|_| format!("{data_type} requiere un número válido")),
+        _ => Ok(()),
+    }
+}
+
+fn validate_text_length(value: &str, column: &ColumnMetadata) -> Result<(), String> {
+    if let Some(length) = column.length
+        && value.chars().count() > length as usize
+    {
+        return Err(format!("supera la longitud máxima de {length}"));
+    }
+    Ok(())
+}
+
+fn validate_decimal_value(value: &str, column: &ColumnMetadata) -> Result<(), String> {
+    validate_decimal_syntax(value).map_err(|_| "requiere un número decimal válido".to_owned())?;
+    let Some(scale) = column.scale else {
+        return Ok(());
+    };
+    let fractional_digits = value
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    if fractional_digits > scale as usize {
+        return Err(format!("permite como máximo {scale} decimales"));
+    }
+    if let Some(precision) = column.precision {
+        let unsigned = value.trim_start_matches(|character| matches!(character, '+' | '-'));
+        let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+        let integer_digits = integer.trim_start_matches('0').len();
+        let significant_digits = integer_digits + fraction.len();
+        if significant_digits > precision as usize {
+            return Err(format!("supera la precisión máxima de {precision}"));
+        }
+        if integer_digits > precision.saturating_sub(scale) as usize {
+            return Err(format!(
+                "permite como máximo {} dígitos enteros",
+                precision.saturating_sub(scale)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_decimal_syntax(value: &str) -> Result<(), ()> {
+    let unsigned = value.trim_start_matches(|character| matches!(character, '+' | '-'));
+    let Some((integer, fraction)) =
+        unsigned
+            .split_once('.')
+            .map_or(Some((unsigned, "")), |(integer, fraction)| {
+                (!integer.is_empty() || !fraction.is_empty()).then_some((integer, fraction))
+            })
+    else {
+        return Err(());
+    };
+    if (integer.is_empty() && fraction.is_empty())
+        || !integer.chars().all(|character| character.is_ascii_digit())
+        || !fraction.chars().all(|character| character.is_ascii_digit())
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn table_copy_text(
@@ -3053,6 +4868,7 @@ fn table_copy_text(
                 anchor_column.max(column).saturating_add(1),
             )
         }
+        TableCopySource::VisualRows => return None,
     };
 
     if end_row > page.rows.len() || end_column > page.columns.len() {
@@ -3071,15 +4887,64 @@ fn table_copy_text(
     Some(lines.join("\n"))
 }
 
+fn table_copy_rows_text(
+    page: &TablePage,
+    anchor_row: Option<usize>,
+    selected_row: Option<usize>,
+    include_header: bool,
+) -> Option<String> {
+    if page.columns.is_empty() || page.rows.is_empty() {
+        return None;
+    }
+    let anchor_row = anchor_row?;
+    let selected_row = selected_row?;
+    let start_row = anchor_row.min(selected_row);
+    let end_row = anchor_row.max(selected_row);
+    if end_row >= page.rows.len() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if include_header {
+        lines.push(page.columns.join("\t"));
+    }
+    lines.extend(
+        page.rows[start_row..=end_row]
+            .iter()
+            .map(|values| values.join("\t")),
+    );
+    Some(lines.join("\n"))
+}
+
+fn shift_row_indexes(rows: &BTreeSet<usize>, removed_row: usize) -> BTreeSet<usize> {
+    rows.iter()
+        .filter_map(|row_index| {
+            if *row_index == removed_row {
+                None
+            } else if *row_index > removed_row {
+                Some(*row_index - 1)
+            } else {
+                Some(*row_index)
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        TableCopySource, format_table_type, is_write_sql, normalize_definition_for_edit,
-        reorder_table_page, shifted_index, table_copy_text, table_filter_suggestions,
-        table_sort_suggestions,
+        TableCopySource, TableDateTimeKind, TableDraftChange, compact_table_summary_value,
+        contains_executable_table_sql, format_parsed_table_date_time, format_table_type,
+        is_write_sql, normalize_definition_for_edit, parse_table_date_time_value,
+        reorder_table_page, selected_table_value, shift_row_indexes, shifted_index,
+        store_table_cell_draft, table_copy_rows_text, table_copy_text, table_date_time_kind,
+        table_draft_exit_message, table_execution_committed, table_execution_rolled_back,
+        table_exit_message, table_filter_suggestions, table_sort_suggestions,
+        validate_table_cell_value,
     };
-    use crate::db::models::{ColumnMetadata, TablePage};
+    use crate::db::models::{ColumnMetadata, SqlOutput, TablePage};
     use crate::db::query::PageCursor;
+    use std::collections::BTreeSet;
 
     #[test]
     fn detects_writes_conservatively() {
@@ -3240,5 +5105,256 @@ mod tests {
 
         assert_eq!(reordered.columns, ["status", "id", "name"]);
         assert_eq!(reordered.rows, [["active", "1", "Ada"]]);
+    }
+
+    #[test]
+    fn reads_the_complete_selected_cell_value() {
+        let page = TablePage::new(
+            vec!["id".to_owned(), "description".to_owned()],
+            vec![vec!["1".to_owned(), "A complete value".to_owned()]],
+            None,
+            false,
+            None,
+        )
+        .expect("valid table page");
+
+        assert_eq!(
+            selected_table_value(&page, Some(0), 1).as_deref(),
+            Some("A complete value")
+        );
+        assert!(selected_table_value(&page, None, 1).is_none());
+    }
+
+    #[test]
+    fn validates_table_cell_values_against_column_metadata() {
+        let varchar = ColumnMetadata {
+            name: "name".to_owned(),
+            data_type: "varchar".to_owned(),
+            length: Some(5),
+            precision: None,
+            scale: None,
+            nullable: false,
+            ordinal_position: 1,
+        };
+        assert!(validate_table_cell_value("Ada", &varchar).is_ok());
+        assert!(validate_table_cell_value("Too long", &varchar).is_err());
+
+        let integer = ColumnMetadata {
+            data_type: "int".to_owned(),
+            ..varchar.clone()
+        };
+        assert!(validate_table_cell_value("42", &integer).is_ok());
+        assert!(validate_table_cell_value("not-a-number", &integer).is_err());
+
+        let nullable = ColumnMetadata {
+            nullable: true,
+            ..varchar
+        };
+        assert!(validate_table_cell_value("NULL", &nullable).is_ok());
+    }
+
+    #[test]
+    fn validates_decimal_precision_and_scale() {
+        let decimal = ColumnMetadata {
+            name: "amount".to_owned(),
+            data_type: "decimal".to_owned(),
+            length: None,
+            precision: Some(5),
+            scale: Some(2),
+            nullable: false,
+            ordinal_position: 1,
+        };
+
+        assert!(validate_table_cell_value("123.45", &decimal).is_ok());
+        assert!(validate_table_cell_value("123.456", &decimal).is_err());
+        assert!(validate_table_cell_value("1234.56", &decimal).is_err());
+    }
+
+    #[test]
+    fn stores_updates_and_reverts_a_cell_draft() {
+        let mut drafts = Vec::new();
+        assert_eq!(
+            store_table_cell_draft(
+                &mut drafts,
+                2,
+                "name".to_owned(),
+                "Ada".to_owned(),
+                "Grace".to_owned(),
+            ),
+            TableDraftChange::Saved
+        );
+        assert_eq!(drafts[0].value, "Grace");
+
+        assert_eq!(
+            store_table_cell_draft(
+                &mut drafts,
+                2,
+                "NAME".to_owned(),
+                "Ada".to_owned(),
+                "Marie".to_owned(),
+            ),
+            TableDraftChange::Updated
+        );
+        assert_eq!(drafts[0].value, "Marie");
+
+        assert_eq!(
+            store_table_cell_draft(
+                &mut drafts,
+                2,
+                "name".to_owned(),
+                "Ada".to_owned(),
+                "Ada".to_owned(),
+            ),
+            TableDraftChange::Reverted
+        );
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn describes_pending_drafts_before_table_exit() {
+        assert_eq!(
+            table_draft_exit_message(1),
+            "Hay 1 borrador sin guardar. ¿Salir y descartarlos? [y/N]"
+        );
+        assert_eq!(
+            table_draft_exit_message(2),
+            "Hay 2 borradores sin guardar. ¿Salir y descartarlos? [y/N]"
+        );
+        assert_eq!(
+            table_exit_message(0, 1, 0),
+            "Hay 1 fila marcada para borrar sin guardar. ¿Salir y descartarla? [y/N]"
+        );
+        assert_eq!(
+            table_exit_message(2, 3, 0),
+            "Hay 2 borradores y 3 filas marcadas para borrar sin guardar. ¿Salir y descartar los cambios? [y/N]"
+        );
+        assert_eq!(
+            table_exit_message(0, 0, 1),
+            "Hay 1 fila nueva sin guardar. ¿Salir y descartarla? [y/N]"
+        );
+    }
+
+    #[test]
+    fn compacts_values_for_the_pending_changes_summary() {
+        assert_eq!(compact_table_summary_value(""), "<vacío>");
+        assert_eq!(compact_table_summary_value("line\none"), "line↵one");
+
+        let long_value = "a".repeat(40);
+        assert_eq!(
+            compact_table_summary_value(&long_value),
+            format!("{}…", "a".repeat(36))
+        );
+    }
+
+    #[test]
+    fn recognizes_only_executable_staged_sql_statements() {
+        assert!(contains_executable_table_sql(
+            "-- update ignored\nset quoted_identifier on\nUPDATE \"dbo\".\"orders\""
+        ));
+        assert!(contains_executable_table_sql(
+            "delete from \"dbo\".\"orders\""
+        ));
+        assert!(contains_executable_table_sql(
+            "insert into \"dbo\".\"orders\""
+        ));
+        assert!(!contains_executable_table_sql(
+            "-- insert ignored\nset quoted_identifier on\n"
+        ));
+    }
+
+    #[test]
+    fn clears_table_changes_only_after_a_confirmed_commit_marker() {
+        let committed = SqlOutput {
+            stdout: format!(
+                "{}\n",
+                crate::db::sybase::queries::staged_committed_marker()
+            ),
+            stderr: String::new(),
+            success: true,
+        };
+        let rolled_back = SqlOutput {
+            stdout: crate::db::sybase::queries::staged_rolled_back_marker().to_owned(),
+            stderr: String::new(),
+            success: true,
+        };
+        let process_failed_with_commit_marker = SqlOutput {
+            stdout: crate::db::sybase::queries::staged_committed_marker().to_owned(),
+            stderr: String::new(),
+            success: false,
+        };
+
+        assert!(table_execution_committed(&committed));
+        assert!(!table_execution_committed(&rolled_back));
+        assert!(!table_execution_committed(
+            &process_failed_with_commit_marker
+        ));
+        assert!(table_execution_rolled_back(&rolled_back));
+    }
+
+    #[test]
+    fn copies_a_range_of_selected_rows_with_optional_header() {
+        let page = TablePage::new(
+            vec!["id".to_owned(), "name".to_owned()],
+            vec![
+                vec!["1".to_owned(), "Ada".to_owned()],
+                vec!["2".to_owned(), "Grace".to_owned()],
+                vec!["3".to_owned(), "Marie".to_owned()],
+            ],
+            None,
+            false,
+            None,
+        )
+        .expect("valid table page");
+
+        assert_eq!(
+            table_copy_rows_text(&page, Some(2), Some(1), false).as_deref(),
+            Some("2\tGrace\n3\tMarie")
+        );
+        assert_eq!(
+            table_copy_rows_text(&page, Some(2), Some(1), true).as_deref(),
+            Some("id\tname\n2\tGrace\n3\tMarie")
+        );
+    }
+
+    #[test]
+    fn shifts_row_indexes_after_discarding_a_new_row() {
+        let rows = BTreeSet::from([1, 3, 4]);
+        assert_eq!(shift_row_indexes(&rows, 1), BTreeSet::from([2, 3]));
+    }
+
+    #[test]
+    fn parses_and_formats_date_time_values() {
+        let date = parse_table_date_time_value("2024-02-29", TableDateTimeKind::Date)
+            .expect("leap day is valid");
+        assert_eq!(
+            format_parsed_table_date_time(&date, TableDateTimeKind::Date),
+            "2024-02-29"
+        );
+
+        let datetime =
+            parse_table_date_time_value("Jun 1 2024 12:05:07PM", TableDateTimeKind::DateTime)
+                .expect("ASE datetime format is supported");
+        assert_eq!(
+            format_parsed_table_date_time(&datetime, TableDateTimeKind::DateTime),
+            "2024-06-01 12:05:07"
+        );
+
+        let time = parse_table_date_time_value("23:59:58.123", TableDateTimeKind::Time)
+            .expect("time with fractional seconds is supported");
+        assert_eq!(
+            format_parsed_table_date_time(&time, TableDateTimeKind::Time),
+            "23:59:58.123"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_dates_and_identifies_date_time_types() {
+        assert!(parse_table_date_time_value("2023-02-29", TableDateTimeKind::Date).is_err());
+        assert!(parse_table_date_time_value("25:00", TableDateTimeKind::Time).is_err());
+        assert_eq!(
+            table_date_time_kind("datetime"),
+            Some(TableDateTimeKind::DateTime)
+        );
+        assert_eq!(table_date_time_kind("varchar"), None);
     }
 }

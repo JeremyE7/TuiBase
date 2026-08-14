@@ -30,7 +30,17 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         _ => render_browser(frame, app),
     }
 
-    if app.mode == AppMode::Table && app.current_filter_session().is_some() {
+    if app.mode == AppMode::Table && app.current_table_sql_preview().is_some() {
+        render_table_sql_preview(frame, app);
+    } else if app.mode == AppMode::Table && app.current_table_changes_summary().is_some() {
+        render_table_changes_summary(frame, app);
+    } else if app.mode == AppMode::Table && app.current_table_date_time_picker().is_some() {
+        render_table_date_time_picker(frame, app);
+    } else if app.mode == AppMode::Table && app.current_table_cell_editor().is_some() {
+        render_table_cell_editor(frame, app);
+    } else if app.mode == AppMode::Table && app.current_table_value_modal().is_some() {
+        render_table_value_modal(frame, app);
+    } else if app.mode == AppMode::Table && app.current_filter_session().is_some() {
         render_table_filter_overlay(frame, app);
     } else if app.mode == AppMode::Table && app.current_sort_session().is_some() {
         render_table_sort_overlay(frame, app);
@@ -225,18 +235,53 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
             anchor_column.max(app.table_column_index),
         )
     });
+    let row_visual_range = app.table_row_visual_anchor.map(|anchor_row| {
+        let row = selected_row.unwrap_or(anchor_row);
+        (anchor_row.min(row), anchor_row.max(row))
+    });
+    let drafts = app.table_cell_drafts.clone();
+    let row_deletions = app.table_row_deletions.clone();
+    let new_rows = app.table_new_rows.clone();
     let rows = page.rows.iter().enumerate().map(|(row_index, values)| {
         Row::new(column_range.clone().map(|index| {
-            let value = values.get(index).map(|value| value.as_str()).unwrap_or("");
-            let selected =
+            let column = &page.columns[index];
+            let draft = drafts.iter().find(|draft| {
+                draft.row_index == row_index && draft.column.eq_ignore_ascii_case(column)
+            });
+            let value = draft
+                .map(|draft| draft.value.as_str())
+                .or_else(|| values.get(index).map(|value| value.as_str()))
+                .unwrap_or("");
+            let selected_row = row_visual_range
+                .is_some_and(|(row_start, row_end)| row_index >= row_start && row_index <= row_end);
+            let selected_cell =
                 visual_range.is_some_and(|(row_start, row_end, column_start, column_end)| {
                     row_index >= row_start
                         && row_index <= row_end
                         && index >= column_start
                         && index <= column_end
                 });
-            if selected {
+            let marked_for_deletion = row_deletions.contains(&row_index);
+            let is_new_row = new_rows.contains(&row_index);
+            if marked_for_deletion {
+                Span::styled(
+                    value,
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                )
+            } else if is_new_row {
+                Span::styled(
+                    value,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if selected_row || selected_cell {
                 Span::styled(value, Style::default().bg(Color::Blue).fg(Color::White))
+            } else if draft.is_some() {
+                Span::styled(value, Style::default().fg(Color::Yellow))
             } else {
                 Span::raw(value)
             }
@@ -251,6 +296,21 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         .active_table_sort()
         .map(|sort| format!(" · orden: {sort}"))
         .unwrap_or_default();
+    let draft_label = if app.table_cell_drafts.is_empty() {
+        String::new()
+    } else {
+        format!(" · borradores: {}", app.table_cell_drafts.len())
+    };
+    let deletion_label = if app.table_row_deletions.is_empty() {
+        String::new()
+    } else {
+        format!(" · borrar: {}", app.table_row_deletions.len())
+    };
+    let new_row_label = if app.table_new_rows.is_empty() {
+        String::new()
+    } else {
+        format!(" · nuevas: {}", app.table_new_rows.len())
+    };
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(TABLE_COLUMN_SPACING as u16)
@@ -259,7 +319,7 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         .cell_highlight_style(Style::default().bg(Color::LightYellow).fg(Color::Black))
         .block(panel_block(
             format!(
-                " Tabla · {} · {} cols · {} índices{}{}{} · Esc salir ",
+                " Tabla · {} · {} cols · {} índices{}{}{}{}{}{} · Esc salir ",
                 app.content_title,
                 app.table_metadata
                     .as_ref()
@@ -276,6 +336,9 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
                 },
                 filter_label,
                 sort_label,
+                draft_label,
+                deletion_label,
+                new_row_label,
             ),
             true,
         ));
@@ -374,6 +437,335 @@ fn render_table_copy_overlay(frame: &mut Frame<'_>, app: &App) {
         }
     };
     frame.render_widget(content, area);
+}
+
+fn render_table_changes_summary(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(84, 72, frame.area());
+    frame.render_widget(Clear, area);
+
+    let Some(summary) = app.current_table_changes_summary() else {
+        return;
+    };
+    let block = panel_block(" Cambios pendientes · Enter SQL · Esc cerrar ", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Resumen staged · no se ejecuta SQL",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(format!(
+        "Celdas editadas: {}",
+        summary.edited_cells.len()
+    )));
+    if summary.edited_cells.is_empty() {
+        lines.push(Line::from("  (ninguna)"));
+    } else {
+        lines.extend(
+            summary
+                .edited_cells
+                .iter()
+                .map(|change| Line::from(format!("  {change}"))),
+        );
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Filas nuevas: {}",
+        summary.new_row_count
+    )));
+    lines.push(Line::from(format!(
+        "Filas marcadas para borrar: {}",
+        summary.deleted_rows.len()
+    )));
+    if !summary.deleted_rows.is_empty() {
+        let rows = summary
+            .deleted_rows
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(format!("  Filas: {rows}")));
+    }
+
+    lines.push(Line::from(""));
+    if summary.identity_columns.is_empty() {
+        lines.push(Line::from("Identidad detectada: ninguna"));
+    } else {
+        lines.push(Line::from(format!(
+            "Identidad detectada: {}",
+            summary.identity_columns.join(", ")
+        )));
+    }
+    if let Some(warning) = summary.identity_warning.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("Advertencia: {warning}"),
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter abre la vista previa SQL; todavía no se ejecuta nada.",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((app.table_changes_summary_scroll, 0)),
+        inner,
+    );
+}
+
+fn render_table_sql_preview(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(90, 82, frame.area());
+    frame.render_widget(Clear, area);
+
+    let Some(preview) = app.current_table_sql_preview() else {
+        return;
+    };
+    let block = panel_block(
+        " SQL staged · Ctrl+S ejecutar · Esc vuelve al resumen ",
+        true,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    if preview.blockers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No hay bloqueos de seguridad detectados.",
+            Style::default().fg(Color::LightGreen),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "BLOQUEOS: estas operaciones no tienen SQL seguro generado",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(preview.blockers.iter().map(|blocker| {
+            Line::from(Span::styled(
+                format!("  • {blocker}"),
+                Style::default().fg(Color::LightRed),
+            ))
+        }));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "SQL generado para revisión:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        "La ejecución está protegida por commit/rollback transaccional.",
+        Style::default().fg(Color::LightCyan),
+    )));
+    lines.extend(
+        preview
+            .sql
+            .lines()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Gray)))),
+    );
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((app.table_sql_preview_scroll, 0)),
+        inner,
+    );
+}
+
+fn render_table_date_time_picker(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(72, 44, frame.area());
+    frame.render_widget(Clear, area);
+
+    let Some(session) = app.current_table_date_time_picker() else {
+        return;
+    };
+    let outer = panel_block(
+        format!(
+            " Picker · {} · fila {} · Enter guarda · Esc cancela ",
+            session.column, session.row_number
+        ),
+        true,
+    );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(7),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    let metadata = Paragraph::new(format!(
+        "Tipo: {} · NULL permitido: {}\nComponente: {}",
+        session.data_type,
+        if session.nullable { "sí" } else { "no" },
+        table_date_time_component_name(session),
+    ))
+    .block(panel_block(" Metadata ", false));
+    frame.render_widget(metadata, sections[0]);
+
+    let selected_style = Style::default()
+        .bg(Color::LightYellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+    let component = |label: String, index: usize| {
+        if session.selected_component == index && !session.is_null {
+            Span::styled(label, selected_style)
+        } else {
+            Span::raw(label)
+        }
+    };
+    let mut lines = Vec::new();
+    if session.is_null {
+        lines.push(Line::from(Span::styled(
+            "Valor: <NULL>",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        if session.show_date {
+            lines.push(Line::from(vec![
+                Span::raw("Fecha: "),
+                component(format!("{:04}", session.year), 0),
+                Span::raw("-"),
+                component(format!("{:02}", session.month), 1),
+                Span::raw("-"),
+                component(format!("{:02}", session.day), 2),
+            ]));
+        }
+        if session.show_time {
+            let offset = if session.show_date { 3 } else { 0 };
+            let mut time = vec![
+                Span::raw("Hora: "),
+                component(format!("{:02}", session.hour), offset),
+                Span::raw(":"),
+                component(format!("{:02}", session.minute), offset + 1),
+                Span::raw(":"),
+                component(format!("{:02}", session.second), offset + 2),
+            ];
+            if !session.fractional_seconds.is_empty() {
+                time.push(Span::raw(format!(".{}", session.fractional_seconds)));
+            }
+            lines.push(Line::from(time));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(panel_block(" Valor ", false)),
+        sections[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new("Tab/Shift+Tab o ←/→ cambia · ↑/↓ ajusta · Space alterna NULL")
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Yellow)),
+        sections[2],
+    );
+}
+
+fn table_date_time_component_name(
+    session: &crate::app::TableDateTimePickerSession,
+) -> &'static str {
+    if session.is_null {
+        return "NULL";
+    }
+    let names = if session.show_date && session.show_time {
+        ["año", "mes", "día", "hora", "minuto", "segundo"]
+    } else if session.show_date {
+        ["año", "mes", "día", "", "", ""]
+    } else {
+        ["hora", "minuto", "segundo", "", "", ""]
+    };
+    names[session.selected_component]
+}
+
+fn render_table_cell_editor(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(76, 46, frame.area());
+    frame.render_widget(Clear, area);
+
+    let Some(session) = app.current_table_cell_editor() else {
+        return;
+    };
+    let outer = panel_block(
+        format!(
+            " Editar celda · {} · fila {} · Enter/Ctrl+S guarda · Esc cancela ",
+            session.column, session.row_number
+        ),
+        true,
+    );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    let metadata = Paragraph::new(format!(
+        "Tipo: {} · NULL permitido: {}\nValor original: {}",
+        session.data_type,
+        if session.nullable { "sí" } else { "no" },
+        session.original_value
+    ))
+    .block(panel_block(" Metadata ", false));
+    frame.render_widget(metadata, sections[0]);
+
+    let input_block = panel_block(" Valor borrador ", false);
+    let input_inner = input_block.inner(sections[1]);
+    frame.render_widget(input_block, sections[1]);
+    frame.render_widget(&session.input, input_inner);
+
+    frame.render_widget(
+        Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Yellow)),
+        sections[2],
+    );
+}
+
+fn render_table_value_modal(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(78, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let Some(modal) = app.current_table_value_modal() else {
+        return;
+    };
+    let block = panel_block(
+        format!(
+            " Valor · {} · fila {} · Enter/Esc cerrar ",
+            modal.column, modal.row_number
+        ),
+        true,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(4)])
+        .split(inner);
+    let metadata = Paragraph::new(format!(
+        "Columna: {}\nTipo: {}",
+        modal.column, modal.data_type
+    ))
+    .block(panel_block(" Metadata ", false));
+    frame.render_widget(metadata, sections[0]);
+
+    let value = Paragraph::new(modal.value.as_str())
+        .block(panel_block(" Valor completo · j/k o ↑/↓ desplaza ", false))
+        .wrap(Wrap { trim: false })
+        .scroll((app.table_value_scroll, 0));
+    frame.render_widget(value, sections[1]);
 }
 
 fn render_table_filter_overlay(frame: &mut Frame<'_>, app: &App) {
@@ -822,14 +1214,21 @@ fn render_help(frame: &mut Frame<'_>) {
         "  Enter         tabla/detalle       e          editar SP/función/vista",
         "  E             editar datos T-SQL  :          consulta T-SQL",
         "\nTABLA",
+        "  Enter         ver valor completo de la celda",
+        "  e             editar celda/picker y guardar borrador local",
         "  i             metadata de columnas e índices",
         "  y             copiar celda/metadata       Y menú de copia",
         "  v             selección visual            Esc cancela",
+        "  Shift+V       selección visual de filas",
+        "  d             marcar fila/rango para borrar",
+        "  dd            copiar y marcar fila        u deshacer/descartar",
+        "  +             fila nueva                 Shift+= clonar fila",
         "  j/k           desplazarse                h/l mover columna",
         "  c             buscar columna             p fijar/desfijar",
         "  f             filtro con autocompletado  F limpiar filtro",
         "  o             ordenar columnas           O limpiar orden",
-        "  ?             ayuda               q          salir",
+        "  Ctrl+S        resumen de cambios staged",
+        "  /             búsqueda global             ? ayuda · q salir",
         "",
         "EDITOR NVIM-LIKE",
         "  i/a/A/I       insertar            Esc        NORMAL / cerrar",

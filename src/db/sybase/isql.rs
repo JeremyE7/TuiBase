@@ -368,11 +368,9 @@ impl DatabaseBackend for IsqlBackend {
                 bail!("El cursor keyset no coincide con las columnas ordenadas");
             }
         }
-        let output = self.run_sql(
-            profile,
-            database,
-            &queries::query_table(object, query, &columns, &metadata.indexes),
-        )?;
+        let sql = queries::query_table(object, query, &columns, &metadata.indexes)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let output = self.run_sql(profile, database, &sql)?;
 
         if !output.success {
             bail!("No se pudo consultar la tabla: {}", output.combined());
