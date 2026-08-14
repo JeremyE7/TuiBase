@@ -1,6 +1,6 @@
 use crate::db::{
-    models::{DbObject, ObjectKind, TableIdentifier},
-    query::{FilterOperator, PageCursor, SortDirection, TableQuery},
+    models::{DbObject, IndexMetadata, ObjectKind, TableIdentifier, TableMetadata},
+    query::{FilterOperator, PageCursor, SortDirection, SortSpec, TableQuery},
 };
 
 const ROW_MARKER: &str = "__ASE_TUI_ROW__|";
@@ -178,9 +178,15 @@ pub fn table_metadata(object: &DbObject) -> String {
     );
 }
 
-pub fn query_table(object: &DbObject, query: &TableQuery, columns: &[(String, String)]) -> String {
+pub fn query_table(
+    object: &DbObject,
+    query: &TableQuery,
+    columns: &[(String, String)],
+    indexes: &[IndexMetadata],
+) -> String {
     let table = qualified_identifier(&object.owner, &object.name);
-    let where_clause = query
+    let sort = effective_sort_specs(query, columns, indexes);
+    let mut predicates = query
         .filters
         .iter()
         .map(|filter| {
@@ -191,19 +197,22 @@ pub fn query_table(object: &DbObject, query: &TableQuery, columns: &[(String, St
             )
         })
         .collect::<Vec<_>>();
-    let where_clause = if where_clause.is_empty() {
+    if let Some(PageCursor::Keyset(values)) = query.page.cursor.as_ref()
+        && let Some(seek_clause) = keyset_where_clause(&sort, values)
+    {
+        predicates.push(seek_clause);
+    }
+    let where_clause = if predicates.is_empty() {
         String::new()
     } else {
-        format!("\nwhere {}", where_clause.join("\n  and "))
+        format!("\nwhere {}", predicates.join("\n  and "))
     };
-    let order_clause = if query.sort.is_empty() {
+    let order_clause = if sort.is_empty() {
         String::new()
     } else {
         format!(
             "\norder by {}",
-            query
-                .sort
-                .iter()
+            sort.iter()
                 .map(|sort| {
                     format!(
                         "{} {}",
@@ -218,13 +227,11 @@ pub fn query_table(object: &DbObject, query: &TableQuery, columns: &[(String, St
                 .join(", ")
         )
     };
-    let offset = match query.page.cursor.as_ref() {
-        Some(PageCursor::Offset(value)) => *value,
-        _ => 0,
+    let page_limit = query.page.limit.max(1) as u64;
+    let fetch_limit = match query.page.cursor.as_ref() {
+        Some(PageCursor::Offset(value)) => value.saturating_add(page_limit).saturating_add(1),
+        _ => page_limit.saturating_add(1),
     };
-    let fetch_limit = offset
-        .saturating_add(query.page.limit.max(1) as u64)
-        .saturating_add(1);
 
     return format!(
         "set nocount on\n\
@@ -247,6 +254,120 @@ pub fn query_table(object: &DbObject, query: &TableQuery, columns: &[(String, St
         where_clause = where_clause,
         order_clause = order_clause,
     );
+}
+
+pub fn effective_sort_specs(
+    query: &TableQuery,
+    columns: &[(String, String)],
+    indexes: &[IndexMetadata],
+) -> Vec<SortSpec> {
+    let mut sort = query.sort.clone();
+    let Some(unique_index) = stable_index(indexes, columns) else {
+        return sort;
+    };
+
+    for column_name in &unique_index.columns {
+        if !sort
+            .iter()
+            .any(|spec| spec.column.eq_ignore_ascii_case(column_name))
+        {
+            sort.push(SortSpec::ascending(column_name.clone()));
+        }
+    }
+
+    sort
+}
+
+pub fn keyset_pagination_supported(query: &TableQuery, metadata: &TableMetadata) -> bool {
+    let columns = metadata
+        .columns
+        .iter()
+        .map(|column| (column.name.clone(), column.data_type.clone()))
+        .collect::<Vec<_>>();
+    let sort = effective_sort_specs(query, &columns, &metadata.indexes);
+
+    !sort.is_empty()
+        && stable_index(&metadata.indexes, &columns).is_some()
+        && sort.iter().all(|spec| {
+            metadata
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&spec.column))
+                .is_some_and(|column| {
+                    !column.nullable && is_keyset_sortable_type(&column.data_type)
+                })
+        })
+}
+
+fn stable_index<'a>(
+    indexes: &'a [IndexMetadata],
+    columns: &[(String, String)],
+) -> Option<&'a IndexMetadata> {
+    indexes
+        .iter()
+        .find(|index| index.is_primary && index_is_usable(index, columns))
+        .or_else(|| {
+            indexes
+                .iter()
+                .find(|index| index.is_unique && index_is_usable(index, columns))
+        })
+}
+
+fn index_is_usable(index: &IndexMetadata, columns: &[(String, String)]) -> bool {
+    !index.columns.is_empty()
+        && index.columns.iter().all(|column| {
+            columns
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(column))
+        })
+}
+
+fn is_keyset_sortable_type(data_type: &str) -> bool {
+    !matches!(
+        data_type.to_ascii_lowercase().as_str(),
+        "image" | "text" | "unitext" | "ntext"
+    )
+}
+
+fn keyset_where_clause(sort: &[SortSpec], values: &[String]) -> Option<String> {
+    if sort.is_empty() || sort.len() != values.len() {
+        return None;
+    }
+
+    let branches = sort
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let comparison = format!(
+                "{} {} '{}'",
+                quote_identifier(&spec.column),
+                match spec.direction {
+                    SortDirection::Ascending => ">",
+                    SortDirection::Descending => "<",
+                },
+                string_literal(&values[index]),
+            );
+            if index == 0 {
+                comparison
+            } else {
+                let equal_prefix = sort[..index]
+                    .iter()
+                    .enumerate()
+                    .map(|(prefix_index, prefix)| {
+                        format!(
+                            "{} = '{}'",
+                            quote_identifier(&prefix.column),
+                            string_literal(&values[prefix_index]),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n      and ");
+                format!("({equal_prefix}\n      and {comparison})")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Some(format!("({})", branches.join("\n   or ")))
 }
 
 fn row_expression(columns: &[(String, String)]) -> String {
@@ -336,13 +457,13 @@ pub fn table_identifier(object: &DbObject) -> TableIdentifier {
 #[cfg(test)]
 mod tests {
     use crate::db::{
-        models::DbObject,
-        query::{FilterOperator, FilterSpec, PageRequest, SortSpec, TableQuery},
+        models::{ColumnMetadata, DbObject, IndexMetadata, TableIdentifier, TableMetadata},
+        query::{FilterOperator, FilterSpec, PageCursor, PageRequest, SortSpec, TableQuery},
     };
 
     use super::{
-        ObjectKind, qualified_identifier, query_table, string_literal, table_identifier,
-        table_metadata,
+        ObjectKind, keyset_pagination_supported, qualified_identifier, query_table, string_literal,
+        table_identifier, table_metadata,
     };
 
     #[test]
@@ -377,6 +498,7 @@ mod tests {
                 ("id".to_owned(), "int".to_owned()),
                 ("status".to_owned(), "varchar".to_owned()),
             ],
+            &[],
         );
 
         assert!(sql.contains("order by \"created_at\" desc"));
@@ -385,6 +507,127 @@ mod tests {
         assert!(sql.contains("set quoted_identifier on"));
         assert!(sql.contains("set rowcount 11"));
         assert!(!sql.contains("active'%'"));
+    }
+
+    #[test]
+    fn appends_a_unique_index_as_a_stable_pagination_tie_breaker() {
+        let object = DbObject {
+            owner: "dbo".to_owned(),
+            name: "orders".to_owned(),
+            kind: ObjectKind::Table,
+        };
+        let mut query = TableQuery::default();
+        query.sort.push(SortSpec::descending("created_at"));
+
+        let sql = query_table(
+            &object,
+            &query,
+            &[
+                ("id".to_owned(), "int".to_owned()),
+                ("created_at".to_owned(), "datetime".to_owned()),
+            ],
+            &[IndexMetadata {
+                name: "ux_orders_id".to_owned(),
+                columns: vec!["id".to_owned()],
+                is_unique: true,
+                is_primary: false,
+            }],
+        );
+
+        assert!(sql.contains("order by \"created_at\" desc, \"id\" asc"));
+    }
+
+    #[test]
+    fn uses_a_unique_index_when_no_explicit_sort_is_requested() {
+        let object = DbObject {
+            owner: "dbo".to_owned(),
+            name: "orders".to_owned(),
+            kind: ObjectKind::Table,
+        };
+
+        let sql = query_table(
+            &object,
+            &TableQuery::default(),
+            &[("id".to_owned(), "int".to_owned())],
+            &[IndexMetadata {
+                name: "pk_orders".to_owned(),
+                columns: vec!["id".to_owned()],
+                is_unique: false,
+                is_primary: true,
+            }],
+        );
+
+        assert!(sql.contains("order by \"id\" asc"));
+    }
+
+    #[test]
+    fn emits_a_keyset_predicate_for_mixed_multi_column_sorting() {
+        let object = DbObject {
+            owner: "dbo".to_owned(),
+            name: "orders".to_owned(),
+            kind: ObjectKind::Table,
+        };
+        let mut query = TableQuery::new(PageRequest::new(10).expect("valid page size"));
+        query.sort.push(SortSpec::descending("created_at"));
+        query.page.cursor = Some(PageCursor::keyset(vec![
+            "2026-08-14 10:00:00".to_owned(),
+            "42".to_owned(),
+        ]));
+
+        let sql = query_table(
+            &object,
+            &query,
+            &[
+                ("id".to_owned(), "int".to_owned()),
+                ("created_at".to_owned(), "datetime".to_owned()),
+            ],
+            &[IndexMetadata {
+                name: "pk_orders".to_owned(),
+                columns: vec!["id".to_owned()],
+                is_unique: true,
+                is_primary: false,
+            }],
+        );
+
+        assert!(sql.contains("set rowcount 11"));
+        assert!(sql.contains("\"created_at\" < '2026-08-14 10:00:00'"));
+        assert!(sql.contains("\"created_at\" = '2026-08-14 10:00:00'"));
+        assert!(sql.contains("\"id\" > '42'"));
+        assert!(sql.contains("order by \"created_at\" desc, \"id\" asc"));
+    }
+
+    #[test]
+    fn keyset_support_requires_non_nullable_scalar_sort_columns_and_a_unique_index() {
+        let metadata = TableMetadata::new(
+            TableIdentifier::new("dbo", "orders"),
+            vec![ColumnMetadata {
+                name: "id".to_owned(),
+                data_type: "int".to_owned(),
+                length: None,
+                precision: None,
+                scale: None,
+                nullable: false,
+                ordinal_position: 1,
+            }],
+            vec![IndexMetadata {
+                name: "pk_orders".to_owned(),
+                columns: vec!["id".to_owned()],
+                is_unique: true,
+                is_primary: false,
+            }],
+        );
+
+        assert!(keyset_pagination_supported(
+            &TableQuery::default(),
+            &metadata
+        ));
+
+        let mut nullable_metadata = metadata.clone();
+        nullable_metadata.columns[0].nullable = true;
+        assert!(!keyset_pagination_supported(
+            &TableQuery::default(),
+            &nullable_metadata
+        ));
     }
 
     #[test]
@@ -408,6 +651,7 @@ mod tests {
             &object,
             &query,
             &[("name".to_owned(), "varchar".to_owned())],
+            &[],
         );
 
         assert!(sql.contains("like '%50\\%\\_off%' escape '\\'"));
@@ -431,6 +675,7 @@ mod tests {
                 ("payload".to_owned(), "image".to_owned()),
                 ("notes".to_owned(), "text".to_owned()),
             ],
+            &[],
         );
 
         assert!(sql.contains("'<IMAGE>'"));

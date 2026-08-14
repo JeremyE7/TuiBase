@@ -19,6 +19,10 @@ use crate::{
 
 pub use syntax::highlight_sql;
 
+const PIN_ICON: &str = "\u{f08d}";
+const TABLE_COLUMN_WIDTH: usize = 18;
+const TABLE_COLUMN_SPACING: usize = 1;
+
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     match app.mode {
         AppMode::Editor => render_editor(frame, app),
@@ -28,6 +32,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     if app.mode == AppMode::Table && app.current_filter_session().is_some() {
         render_table_filter_overlay(frame, app);
+    } else if app.mode == AppMode::Table && app.current_sort_session().is_some() {
+        render_table_sort_overlay(frame, app);
+    } else if app.mode == AppMode::Table && app.current_column_search_session().is_some() {
+        render_table_column_search_overlay(frame, app);
     } else if app.mode == AppMode::Table && app.table_copy_stage.is_some() {
         render_table_copy_overlay(frame, app);
     }
@@ -171,11 +179,10 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
-    const COLUMN_WIDTH: usize = 18;
-    const COLUMN_SPACING: usize = 1;
     let total_columns = page.columns.len();
     let available_width = table_area.width.saturating_sub(2) as usize;
-    let visible_columns = ((available_width + COLUMN_SPACING) / (COLUMN_WIDTH + COLUMN_SPACING))
+    let visible_columns = ((available_width + TABLE_COLUMN_SPACING)
+        / (TABLE_COLUMN_WIDTH + TABLE_COLUMN_SPACING))
         .max(1)
         .min(total_columns);
     let max_offset = total_columns.saturating_sub(visible_columns);
@@ -192,13 +199,20 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
     app.table_state.select_column(Some(selected_column));
 
     let column_range = position..position + visible_columns;
-    let widths = vec![Constraint::Length(COLUMN_WIDTH as u16); visible_columns];
+    let widths = vec![Constraint::Length(TABLE_COLUMN_WIDTH as u16); visible_columns];
+    let pinned_columns = app.active_table_pinned_columns();
 
-    let header = Row::new(
-        column_range
-            .clone()
-            .map(|index| page.columns[index].as_str()),
-    )
+    let header = Row::new(column_range.clone().map(|index| {
+        let column = &page.columns[index];
+        if pinned_columns
+            .iter()
+            .any(|pinned| pinned.eq_ignore_ascii_case(column))
+        {
+            format!("{PIN_ICON} {column}")
+        } else {
+            column.clone()
+        }
+    }))
     .style(Style::default().add_modifier(Modifier::BOLD));
 
     let selected_row = app.table_state.selected();
@@ -233,15 +247,19 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         .active_table_filter()
         .map(|filter| format!(" · filtro: {filter}"))
         .unwrap_or_default();
+    let sort_label = app
+        .active_table_sort()
+        .map(|sort| format!(" · orden: {sort}"))
+        .unwrap_or_default();
     let table = Table::new(rows, widths)
         .header(header)
-        .column_spacing(COLUMN_SPACING as u16)
+        .column_spacing(TABLE_COLUMN_SPACING as u16)
         .highlight_symbol("▸ ")
         .row_highlight_style(Style::default().bg(Color::Black).fg(Color::Yellow))
         .cell_highlight_style(Style::default().bg(Color::LightYellow).fg(Color::Black))
         .block(panel_block(
             format!(
-                " Tabla · {} · {} cols · {} índices{}{} · Esc salir ",
+                " Tabla · {} · {} cols · {} índices{}{}{} · Esc salir ",
                 app.content_title,
                 app.table_metadata
                     .as_ref()
@@ -257,11 +275,19 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
                     ""
                 },
                 filter_label,
+                sort_label,
             ),
             true,
         ));
 
     frame.render_stateful_widget(table, table_area, &mut app.table_state);
+    render_pinned_column_boundary(
+        frame,
+        table_area,
+        position,
+        visible_columns,
+        app.pinned_table_column_count(),
+    );
 
     let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom).symbols(Set {
         track: "─",
@@ -277,6 +303,41 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         }),
         &mut app.horizontal_scroll,
     );
+}
+
+fn render_pinned_column_boundary(
+    frame: &mut Frame<'_>,
+    table_area: Rect,
+    position: usize,
+    visible_columns: usize,
+    pinned_count: usize,
+) {
+    if pinned_count == 0
+        || pinned_count <= position
+        || pinned_count >= position.saturating_add(visible_columns)
+    {
+        return;
+    }
+
+    let relative_boundary = pinned_count - position;
+    let inner = table_area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let boundary_x = inner
+        .x
+        .saturating_add((relative_boundary * (TABLE_COLUMN_WIDTH + TABLE_COLUMN_SPACING)) as u16)
+        .saturating_sub(TABLE_COLUMN_SPACING as u16);
+    let border_area = Rect {
+        x: boundary_x,
+        y: inner.y,
+        width: 1,
+        height: inner.height,
+    };
+    let border = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(border, border_area);
 }
 
 fn render_table_copy_overlay(frame: &mut Frame<'_>, app: &App) {
@@ -384,6 +445,117 @@ fn render_table_filter_overlay(frame: &mut Frame<'_>, app: &App) {
         .block(panel_block(" Vista previa ", false))
         .wrap(Wrap { trim: true });
     frame.render_widget(preview, sections[2]);
+}
+
+fn render_table_sort_overlay(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(82, 64, frame.area());
+    frame.render_widget(Clear, area);
+
+    let outer = panel_block(
+        " Ordenar tabla · Tab completa · Enter aplica · Esc cancela ",
+        true,
+    );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Min(3),
+        ])
+        .split(inner);
+    let Some(session) = app.current_sort_session() else {
+        return;
+    };
+
+    let input_block = panel_block(" Expresión ", false);
+    frame.render_widget(input_block.clone(), sections[0]);
+    frame.render_widget(&session.input, input_block.inner(sections[0]));
+
+    let items = session
+        .suggestions
+        .iter()
+        .map(|suggestion| ListItem::new(suggestion.label.clone()))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(
+            session
+                .selected_suggestion
+                .min(items.len().saturating_sub(1)),
+        ));
+    }
+    let suggestions = List::new(items)
+        .block(panel_block(" Sugerencias ", false))
+        .highlight_symbol("▸ ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
+    frame.render_stateful_widget(suggestions, sections[1], &mut state);
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Orden interpretado",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if session.preview.is_empty() {
+        lines.push(Line::from(
+            session
+                .parse_error
+                .as_deref()
+                .unwrap_or("Escribe una columna para comenzar"),
+        ));
+    } else {
+        lines.extend(
+            session
+                .preview
+                .iter()
+                .map(|sort| Line::from(format!("✓ {sort}"))),
+        );
+    }
+    let preview = Paragraph::new(Text::from(lines))
+        .block(panel_block(" Vista previa ", false))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(preview, sections[2]);
+}
+
+fn render_table_column_search_overlay(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(72, 46, frame.area());
+    frame.render_widget(Clear, area);
+
+    let outer = panel_block(" Buscar columna · Enter salta · Esc cancela ", true);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(inner);
+    let Some(session) = app.current_column_search_session() else {
+        return;
+    };
+
+    let input_block = panel_block(" Consulta ", false);
+    frame.render_widget(input_block.clone(), sections[0]);
+    frame.render_widget(&session.input, input_block.inner(sections[0]));
+
+    let items = session
+        .suggestions
+        .iter()
+        .map(|column| ListItem::new(column.clone()))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(
+            session
+                .selected_suggestion
+                .min(items.len().saturating_sub(1)),
+        ));
+    }
+    let suggestions = List::new(items)
+        .block(panel_block(" Columnas ", false))
+        .highlight_symbol("▸ ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
+    frame.render_stateful_widget(suggestions, sections[1], &mut state);
 }
 
 fn render_table_metadata(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -654,7 +826,9 @@ fn render_help(frame: &mut Frame<'_>) {
         "  y             copiar celda/metadata       Y menú de copia",
         "  v             selección visual            Esc cancela",
         "  j/k           desplazarse                h/l mover columna",
+        "  c             buscar columna             p fijar/desfijar",
         "  f             filtro con autocompletado  F limpiar filtro",
+        "  o             ordenar columnas           O limpiar orden",
         "  ?             ayuda               q          salir",
         "",
         "EDITOR NVIM-LIKE",

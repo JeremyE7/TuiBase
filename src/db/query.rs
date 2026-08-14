@@ -95,6 +95,33 @@ impl SortSpec {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortParseError {
+    Empty,
+    UnclosedQuote,
+    MissingColumn,
+    UnknownColumn(String),
+    InvalidDirection(String),
+    UnexpectedInput(String),
+}
+
+impl fmt::Display for SortParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("el ordenamiento está vacío"),
+            Self::UnclosedQuote => f.write_str("hay una comilla sin cerrar"),
+            Self::MissingColumn => f.write_str("falta el nombre de la columna"),
+            Self::UnknownColumn(column) => write!(f, "columna desconocida: {column}"),
+            Self::InvalidDirection(direction) => {
+                write!(f, "dirección inválida: {direction}; usa ASC o DESC")
+            }
+            Self::UnexpectedInput(input) => write!(f, "entrada inesperada: {input}"),
+        }
+    }
+}
+
+impl Error for SortParseError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterOperator {
     Equals,
@@ -175,6 +202,107 @@ pub fn parse_filter_expression(
         .into_iter()
         .map(|condition| parse_filter_condition(condition, columns))
         .collect()
+}
+
+pub fn parse_sort_expression(
+    expression: &str,
+    columns: &[String],
+) -> Result<Vec<SortSpec>, SortParseError> {
+    let expression = expression.trim();
+    if expression.is_empty() {
+        return Err(SortParseError::Empty);
+    }
+
+    split_sort_terms(expression)?
+        .into_iter()
+        .map(|term| parse_sort_term(term, columns))
+        .collect()
+}
+
+fn split_sort_terms(expression: &str) -> Result<Vec<&str>, SortParseError> {
+    let chars = expression.char_indices().collect::<Vec<_>>();
+    let mut terms = Vec::new();
+    let mut term_start = 0;
+    let mut quote = None;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let (byte_index, character) = chars[index];
+        if let Some(quote_character) = quote {
+            if character == quote_character {
+                if chars
+                    .get(index + 1)
+                    .is_some_and(|(_, next)| *next == quote_character)
+                {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if character == '"' {
+            quote = Some(character);
+        } else if character == ',' {
+            let term = expression[term_start..byte_index].trim();
+            if term.is_empty() {
+                return Err(SortParseError::UnexpectedInput(
+                    "falta una columna después de la coma".to_owned(),
+                ));
+            }
+            terms.push(term);
+            term_start = byte_index + character.len_utf8();
+        }
+        index += 1;
+    }
+
+    if quote.is_some() {
+        return Err(SortParseError::UnclosedQuote);
+    }
+
+    let last = expression[term_start..].trim();
+    if last.is_empty() {
+        return Err(SortParseError::UnexpectedInput(
+            "falta una columna después de la coma".to_owned(),
+        ));
+    }
+    terms.push(last);
+    Ok(terms)
+}
+
+fn parse_sort_term(term: &str, columns: &[String]) -> Result<SortSpec, SortParseError> {
+    let term = term.trim();
+    let (column_text, remainder) = parse_column(term).map_err(|error| match error {
+        FilterParseError::UnclosedQuote => SortParseError::UnclosedQuote,
+        FilterParseError::MissingColumn => SortParseError::MissingColumn,
+        other => SortParseError::UnexpectedInput(other.to_string()),
+    })?;
+    let column = columns
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(&column_text))
+        .cloned()
+        .ok_or_else(|| SortParseError::UnknownColumn(column_text.clone()))?;
+    let remainder = remainder.trim();
+
+    let direction = if remainder.is_empty() {
+        SortDirection::Ascending
+    } else if let Some(rest) = consume_keyword(remainder, "ASC") {
+        if !rest.trim().is_empty() {
+            return Err(SortParseError::UnexpectedInput(rest.trim().to_owned()));
+        }
+        SortDirection::Ascending
+    } else if let Some(rest) = consume_keyword(remainder, "DESC") {
+        if !rest.trim().is_empty() {
+            return Err(SortParseError::UnexpectedInput(rest.trim().to_owned()));
+        }
+        SortDirection::Descending
+    } else {
+        return Err(SortParseError::InvalidDirection(remainder.to_owned()));
+    };
+
+    Ok(SortSpec { column, direction })
 }
 
 fn split_filter_conditions(expression: &str) -> Result<Vec<&str>, FilterParseError> {
@@ -434,7 +562,7 @@ impl Default for TableQuery {
 mod tests {
     use super::{
         DEFAULT_PAGE_SIZE, FilterOperator, FilterSpec, PageCursor, PageRequest, SortDirection,
-        SortSpec, TableQuery, parse_filter_expression,
+        SortSpec, TableQuery, parse_filter_expression, parse_sort_expression,
     };
 
     #[test]
@@ -510,5 +638,28 @@ mod tests {
     fn rejects_unknown_columns_and_unclosed_quotes() {
         assert!(parse_filter_expression("missing = 1", &["id".to_owned()]).is_err());
         assert!(parse_filter_expression("name = 'Ada", &["name".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parses_multiple_sort_columns_and_defaults_to_ascending() {
+        let sorts = parse_sort_expression(
+            "created_at desc, status",
+            &["created_at".to_owned(), "status".to_owned()],
+        )
+        .expect("valid sort expression");
+
+        assert_eq!(sorts.len(), 2);
+        assert_eq!(sorts[0], SortSpec::descending("created_at"));
+        assert_eq!(sorts[1], SortSpec::ascending("status"));
+    }
+
+    #[test]
+    fn sort_parser_matches_columns_case_insensitively_and_rejects_invalid_direction() {
+        let sorts = parse_sort_expression("STATUS ASC", &["status".to_owned()])
+            .expect("column names are case-insensitive");
+        assert_eq!(sorts, vec![SortSpec::ascending("status")]);
+
+        assert!(parse_sort_expression("status sideways", &["status".to_owned()]).is_err());
+        assert!(parse_sort_expression("missing asc", &["status".to_owned()]).is_err());
     }
 }

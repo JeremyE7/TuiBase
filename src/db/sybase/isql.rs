@@ -13,7 +13,7 @@ use crate::{
             ColumnMetadata, DbObject, IndexMetadata, ObjectKind, SqlOutput, TableMetadata,
             TablePage, TablePreview,
         },
-        query::{PageCursor, TableQuery},
+        query::{PageCursor, SortSpec, TableQuery},
     },
 };
 
@@ -349,10 +349,6 @@ impl DatabaseBackend for IsqlBackend {
         if query.page.limit == 0 {
             bail!("El límite de la página debe ser mayor que cero");
         }
-        if matches!(query.page.cursor.as_ref(), Some(PageCursor::Keyset(_))) {
-            bail!("El backend ASE todavía no admite cursores keyset");
-        }
-
         let offset = query.page.cursor.as_ref().map_or(0, cursor_offset);
         let offset =
             usize::try_from(offset).context("El offset de la página es demasiado grande")?;
@@ -362,10 +358,20 @@ impl DatabaseBackend for IsqlBackend {
             .iter()
             .map(|column| (column.name.clone(), column.data_type.clone()))
             .collect::<Vec<_>>();
+        let keyset_supported = queries::keyset_pagination_supported(query, &metadata);
+        let sort = queries::effective_sort_specs(query, &columns, &metadata.indexes);
+        if let Some(PageCursor::Keyset(values)) = query.page.cursor.as_ref() {
+            if !keyset_supported {
+                bail!("El cursor keyset no es compatible con el ordenamiento actual");
+            }
+            if values.len() != sort.len() {
+                bail!("El cursor keyset no coincide con las columnas ordenadas");
+            }
+        }
         let output = self.run_sql(
             profile,
             database,
-            &queries::query_table(object, query, &columns),
+            &queries::query_table(object, query, &columns, &metadata.indexes),
         )?;
 
         if !output.success {
@@ -373,15 +379,31 @@ impl DatabaseBackend for IsqlBackend {
         }
 
         let page = parse_table_preview(&output.stdout)?;
-        let mut rows = page.rows.into_iter().skip(offset).collect::<Vec<_>>();
+        let columns = page.columns;
+        let mut rows = match query.page.cursor.as_ref() {
+            Some(PageCursor::Offset(_)) => page.rows.into_iter().skip(offset).collect(),
+            _ => page.rows,
+        };
         let has_more = rows.len() > query.page.limit;
         if has_more {
             rows.truncate(query.page.limit);
         }
-        let next_cursor =
-            has_more.then(|| PageCursor::Offset((offset as u64).saturating_add(rows.len() as u64)));
+        let next_cursor = if has_more {
+            if keyset_supported {
+                let last_row = rows.last().context("La página no tiene una última fila")?;
+                Some(PageCursor::Keyset(keyset_cursor_values(
+                    last_row, &columns, &sort,
+                )?))
+            } else {
+                Some(PageCursor::Offset(
+                    (offset as u64).saturating_add(rows.len() as u64),
+                ))
+            }
+        } else {
+            None
+        };
 
-        TablePage::new(page.columns, rows, next_cursor, has_more, None).map_err(Into::into)
+        TablePage::new(columns, rows, next_cursor, has_more, None).map_err(Into::into)
     }
 
     fn execute(&self, profile: &ConnectionProfile, database: &str, sql: &str) -> Result<SqlOutput> {
@@ -522,6 +544,24 @@ fn cursor_offset(cursor: &PageCursor) -> u64 {
     }
 }
 
+fn keyset_cursor_values(
+    row: &[String],
+    columns: &[String],
+    sort: &[SortSpec],
+) -> Result<Vec<String>> {
+    sort.iter()
+        .map(|spec| {
+            let column_index = columns
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(&spec.column))
+                .with_context(|| format!("No se encontró la columna ordenada: {}", spec.column))?;
+            row.get(column_index)
+                .cloned()
+                .with_context(|| format!("La fila no contiene la columna: {}", spec.column))
+        })
+        .collect()
+}
+
 fn parse_fields(value: &str) -> Vec<String> {
     value
         .trim_end_matches('|')
@@ -551,9 +591,11 @@ fn clean_text_chunk(mut chunk: String) -> String {
 #[cfg(test)]
 mod tests {
     use crate::db::models::{IndexMetadata, TableIdentifier};
+    use crate::db::query::SortSpec;
 
     use super::{
-        format_column_type, parse_sp_helpindex, parse_table_metadata, quote_display_identifier,
+        format_column_type, keyset_cursor_values, parse_sp_helpindex, parse_table_metadata,
+        quote_display_identifier,
     };
 
     #[test]
@@ -657,5 +699,17 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn extracts_keyset_values_in_effective_sort_order() {
+        let values = keyset_cursor_values(
+            &["42".to_owned(), "Ada".to_owned(), "active".to_owned()],
+            &["id".to_owned(), "name".to_owned(), "status".to_owned()],
+            &[SortSpec::descending("status"), SortSpec::ascending("id")],
+        )
+        .expect("all sorted columns are present");
+
+        assert_eq!(values, ["active", "42"]);
     }
 }
