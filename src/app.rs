@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -293,6 +293,7 @@ pub struct App {
     sort_session: Option<SortSession>,
     column_search_session: Option<ColumnSearchSession>,
     pub editor_completion: Option<EditorCompletionSession>,
+    column_cache: HashMap<String, Vec<ColumnMetadata>>,
     active_search: Option<String>,
     catalog: CatalogCache,
     search_index: Vec<SearchCatalogEntry>,
@@ -377,6 +378,7 @@ impl App {
             sort_session: None,
             column_search_session: None,
             editor_completion: None,
+            column_cache: HashMap::new(),
             last_key: String::new(),
             editor: None,
             should_quit: false,
@@ -948,6 +950,43 @@ impl App {
                         return items;
                     }
                 }
+            }
+            for (key, cols) in &self.column_cache {
+                let parts: Vec<&str> = key.split('.').collect();
+                if parts.len() != 3 {
+                    continue;
+                }
+                let (db, _schema, table) = (parts[0], parts[1], parts[2]);
+                if !current_db.is_empty() && db != current_db {
+                    continue;
+                }
+                let table_match = qual_lower == table || qual_lower == format!("{}.{}", parts[1], table);
+                if !table_match {
+                    continue;
+                }
+                for col in cols {
+                    let col_lower = col.name.to_ascii_lowercase();
+                    let matches = lower_prefix.is_empty()
+                        || col_lower.starts_with(&lower_prefix)
+                        || (lower_prefix.len() >= 2 && col_lower.contains(&lower_prefix));
+                    if matches {
+                        items.push(CompletionItem {
+                            label: col.name.clone(),
+                            insert_text: col.name.clone(),
+                            detail: format!(
+                                "{} {}",
+                                col.data_type,
+                                if col.nullable { "NULL" } else { "NOT NULL" }
+                            ),
+                        });
+                    }
+                }
+            }
+            if !items.is_empty() {
+                let mut seen = std::collections::HashSet::new();
+                items.retain(|it| seen.insert(it.label.to_ascii_lowercase()));
+                items.sort_by(|a, b| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()));
+                items.truncate(30);
             }
             return items;
         }
@@ -4140,6 +4179,13 @@ impl App {
                     Ok(metadata) => {
                         let column_count = metadata.columns.len();
                         let index_count = metadata.indexes.len();
+                        let cache_key = format!(
+                            "{}.{}.{}",
+                            database.to_ascii_lowercase(),
+                            metadata.identifier.schema.to_ascii_lowercase(),
+                            metadata.identifier.name.to_ascii_lowercase()
+                        );
+                        self.column_cache.insert(cache_key, metadata.columns.clone());
                         self.table_metadata = Some(metadata);
                         self.status = format!(
                             "Metadata cargada · {column_count} columnas · {index_count} índices"
