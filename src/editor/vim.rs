@@ -31,6 +31,7 @@ pub struct VimEditor {
     pub mode: VimMode,
     key_buffer: String,
     dirty: bool,
+    pub scroll: (u16, u16),
 }
 
 impl VimEditor {
@@ -48,6 +49,7 @@ impl VimEditor {
             mode: VimMode::Normal,
             key_buffer: String::new(),
             dirty: false,
+            scroll: (0, 0),
         }
     }
 

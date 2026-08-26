@@ -1042,7 +1042,7 @@ fn format_column_type(column: &crate::db::models::ColumnMetadata) -> String {
     }
 }
 
-fn render_editor(frame: &mut Frame<'_>, app: &App) {
+fn render_editor(frame: &mut Frame<'_>, app: &mut App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(1)])
@@ -1053,13 +1053,17 @@ fn render_editor(frame: &mut Frame<'_>, app: &App) {
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(vertical[0]);
 
-    if let Some(session) = &app.editor {
+    if let Some(session) = app.editor.as_mut() {
+        let cursor = session.editor.textarea.cursor();
+        let (cursor_row, cursor_col) = (cursor.0, cursor.1);
         let title = format!(
-            " {} · {}{} ",
+            " {} · {} · {}:{} {}",
             session.title,
             session.editor.mode,
+            cursor_row + 1,
+            cursor_col + 1,
             if session.editor.is_dirty() {
-                " [+]"
+                "[+]"
             } else {
                 ""
             }
@@ -1067,7 +1071,41 @@ fn render_editor(frame: &mut Frame<'_>, app: &App) {
         let block = panel_block(title, true);
         let inner = block.inner(editor_layout[0]);
         frame.render_widget(block, editor_layout[0]);
-        frame.render_widget(&session.editor.textarea, inner);
+
+        if inner.width > 0 && inner.height > 0 {
+            let height = inner.height as usize;
+            let width = inner.width as usize;
+            {
+                let scroll = &mut session.editor.scroll;
+                let r = cursor_row as u16;
+                if r < scroll.0 {
+                    scroll.0 = r;
+                } else if r >= scroll.0 + height as u16 {
+                    scroll.0 = r - height as u16 + 1;
+                }
+                let c = cursor_col as u16;
+                if c < scroll.1 {
+                    scroll.1 = c;
+                } else if c >= scroll.1 + width as u16 {
+                    scroll.1 = c - width as u16 + 1;
+                }
+            }
+            let scroll = session.editor.scroll;
+            let content = session.editor.text();
+            let base = crate::ui::syntax::highlight_sql(&content);
+            let selection = session.editor.textarea.selection_range();
+            let orig_lines: Vec<String> = session.editor.textarea.lines().iter().cloned().collect();
+            let highlighted = apply_editor_selection(base, &orig_lines, selection);
+            let paragraph = Paragraph::new(highlighted)
+                .wrap(Wrap { trim: false })
+                .scroll(scroll);
+            frame.render_widget(paragraph, inner);
+            let cursor_x = inner.x.saturating_add((cursor_col as u16).saturating_sub(scroll.1));
+            let cursor_y = inner.y.saturating_add((cursor_row as u16).saturating_sub(scroll.0));
+            if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
+                frame.set_cursor_position((cursor_x, cursor_y));
+            }
+        }
     } else {
         frame.render_widget(
             Paragraph::new("No hay una sesión de editor activa")
@@ -1110,6 +1148,105 @@ fn console_text(app: &App) -> Text<'static> {
         lines.push(Line::from(Span::styled(line.to_owned(), style)));
     }
     Text::from(lines)
+}
+
+fn apply_editor_selection(
+    base: Text<'static>,
+    orig_lines: &[String],
+    selection: Option<((usize, usize), (usize, usize))>,
+) -> Text<'static> {
+    let Some(((sr, sc), (er, ec))) = selection else {
+        return base;
+    };
+    let mut base_lines = base.lines;
+    if base_lines.len() < orig_lines.len() {
+        base_lines.resize_with(orig_lines.len(), Line::default);
+    } else if base_lines.len() > orig_lines.len() {
+        base_lines.truncate(orig_lines.len());
+    }
+    let mut out_lines: Vec<Line<'static>> = Vec::with_capacity(base_lines.len());
+    for (row, (mut base_line, orig_line)) in base_lines.into_iter().zip(orig_lines.iter()).enumerate() {
+        if row < sr || row > er {
+            out_lines.push(base_line);
+            continue;
+        }
+        let line_start = if row == sr { sc } else { 0 };
+        let line_end = if row == er {
+            ec
+        } else {
+            orig_line.chars().count()
+        };
+        if line_start >= line_end {
+            out_lines.push(base_line);
+            continue;
+        }
+        if orig_line.is_empty() && base_line.width() == 0 {
+            out_lines.push(Line::from(Span::styled(
+                " ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            )));
+            continue;
+        }
+        if base_line.spans.is_empty() {
+            out_lines.push(base_line);
+            continue;
+        }
+        let mut new_spans: Vec<Span<'static>> = Vec::new();
+        let mut col = 0usize;
+        for span in base_line.spans.drain(..) {
+            let span_content = span.content.into_owned();
+            let span_style = span.style;
+            let span_char_len = span_content.chars().count();
+            let span_end = col + span_char_len;
+            if span_end <= line_start || col >= line_end {
+                new_spans.push(Span::styled(span_content, span_style));
+            } else if col >= line_start && span_end <= line_end {
+                new_spans.push(Span::styled(
+                    span_content,
+                    span_style.add_modifier(Modifier::REVERSED),
+                ));
+            } else {
+                let mut chunk = String::new();
+                let mut chunk_selected: Option<bool> = None;
+                let mut cur_col = col;
+                for ch in span_content.chars() {
+                    let is_selected = cur_col >= line_start && cur_col < line_end;
+                    match chunk_selected {
+                        None => {
+                            chunk_selected = Some(is_selected);
+                            chunk.push(ch);
+                        }
+                        Some(prev) if prev == is_selected => {
+                            chunk.push(ch);
+                        }
+                        Some(prev) => {
+                            let style = if prev {
+                                span_style.add_modifier(Modifier::REVERSED)
+                            } else {
+                                span_style
+                            };
+                            new_spans.push(Span::styled(std::mem::take(&mut chunk), style));
+                            chunk.push(ch);
+                            chunk_selected = Some(is_selected);
+                        }
+                    }
+                    cur_col += 1;
+                }
+                if !chunk.is_empty() {
+                    let is_selected = chunk_selected.unwrap_or(false);
+                    let style = if is_selected {
+                        span_style.add_modifier(Modifier::REVERSED)
+                    } else {
+                        span_style
+                    };
+                    new_spans.push(Span::styled(chunk, style));
+                }
+            }
+            col = span_end;
+        }
+        out_lines.push(Line::from(new_spans));
+    }
+    Text::from(out_lines)
 }
 
 fn render_list(
