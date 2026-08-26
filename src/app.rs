@@ -210,6 +210,23 @@ pub struct EditorSession {
 }
 
 #[derive(Debug, Clone)]
+pub struct CompletionItem {
+    pub label: String,
+    pub insert_text: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditorCompletionSession {
+    pub prefix: String,
+    pub qualifier: Option<String>,
+    pub suggestions: Vec<CompletionItem>,
+    pub selected: usize,
+    pub trigger_row: usize,
+    pub trigger_col: usize,
+}
+
+#[derive(Debug, Clone)]
 enum ConfirmAction {
     Execute { sql: String },
     ExecuteTableChanges { sql: String },
@@ -275,6 +292,7 @@ pub struct App {
     filter_session: Option<FilterSession>,
     sort_session: Option<SortSession>,
     column_search_session: Option<ColumnSearchSession>,
+    pub editor_completion: Option<EditorCompletionSession>,
     active_search: Option<String>,
     catalog: CatalogCache,
     search_index: Vec<SearchCatalogEntry>,
@@ -358,6 +376,7 @@ impl App {
             filter_session: None,
             sort_session: None,
             column_search_session: None,
+            editor_completion: None,
             last_key: String::new(),
             editor: None,
             should_quit: false,
@@ -607,6 +626,26 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        if self.editor_completion.is_some() && self.handle_editor_completion_key(key) {
+            return;
+        }
+        if (key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL))
+            || (key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.open_editor_completion();
+            return;
+        }
+        if key.code == KeyCode::Char('K')
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|s| s.editor.mode == crate::editor::VimMode::Normal)
+        {
+            self.show_editor_hover();
+            return;
+        }
         if matches!(key.code, KeyCode::PageUp) {
             self.content_scroll = self.content_scroll.saturating_sub(8);
             self.status = format!("Consola · scroll {}", self.content_scroll);
@@ -679,6 +718,337 @@ impl App {
                 }
             }
         }
+    }
+
+    fn handle_editor_completion_key(&mut self, key: KeyEvent) -> bool {
+        let Some(comp) = self.editor_completion.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.editor_completion = None;
+                self.status = "Completado cerrado".to_owned();
+                return true;
+            }
+            KeyCode::Up => {
+                if comp.selected == 0 {
+                    comp.selected = comp.suggestions.len().saturating_sub(1);
+                } else {
+                    comp.selected -= 1;
+                }
+                return true;
+            }
+            KeyCode::Down => {
+                comp.selected = (comp.selected + 1) % comp.suggestions.len().max(1);
+                return true;
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                self.accept_editor_completion();
+                return true;
+            }
+            _ => {
+                self.editor_completion = None;
+                return false;
+            }
+        }
+    }
+
+    fn open_editor_completion(&mut self) {
+        let Some(session) = self.editor.as_ref() else {
+            return;
+        };
+        let cursor = session.editor.textarea.cursor();
+        let lines = session.editor.textarea.lines();
+        let line = lines.get(cursor.0).cloned().unwrap_or_default();
+        let (qualifier, prefix) = extract_completion_context(&line, cursor.1);
+        let suggestions = self.build_editor_completions(qualifier.as_deref(), &prefix);
+        if suggestions.is_empty() {
+            self.editor_completion = None;
+            self.status = "Sin sugerencias".to_owned();
+            return;
+        }
+        self.editor_completion = Some(EditorCompletionSession {
+            prefix,
+            qualifier,
+            suggestions,
+            selected: 0,
+            trigger_row: cursor.0,
+            trigger_col: cursor.1,
+        });
+        self.status = "Completado · Tab/Enter acepta · Esc cierra · ↑/↓ navega".to_owned();
+    }
+
+    fn accept_editor_completion(&mut self) {
+        let Some(comp) = self.editor_completion.take() else {
+            return;
+        };
+        let Some(item) = comp.suggestions.get(comp.selected).cloned() else {
+            return;
+        };
+        let Some(session) = self.editor.as_mut() else {
+            return;
+        };
+        let row = comp.trigger_row;
+        let prefix_len = comp.prefix.chars().count();
+        let start_col = comp.trigger_col.saturating_sub(prefix_len);
+        session
+            .editor
+            .textarea
+            .move_cursor(ratatui_textarea::CursorMove::Jump(row as u16, start_col as u16));
+        if prefix_len > 0 {
+            session.editor.textarea.delete_str(prefix_len);
+        }
+        session.editor.textarea.insert_str(&item.insert_text);
+        session.editor.textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
+        // mark dirty via private field access through handle? set dirty directly
+        // VimEditor dirty is private, but we can set via method? There's no setter, but we can reach via session.editor.dirty is private. Use workaround: call insert of empty? Simpler: set via direct field if we make it pub or use a method.
+        // For now, we will just rely on textarea modification not automatically setting dirty; we need to set dirty manually via a hack: make dirty pub or add method.
+        // As a temporary, we will set a flag via a new public method we will add to VimEditor.
+        session.editor.mark_dirty();
+        self.status = format!("Insertado '{}' · {}", item.label, item.detail);
+    }
+
+    fn show_editor_hover(&mut self) {
+        let Some(session) = self.editor.as_ref() else {
+            return;
+        };
+        let cursor = session.editor.textarea.cursor();
+        let lines = session.editor.textarea.lines();
+        let line = lines.get(cursor.0).cloned().unwrap_or_default();
+        let chars: Vec<char> = line.chars().collect();
+        let mut start = cursor.1.min(chars.len());
+        while start > 0
+            && {
+                let c = chars[start - 1];
+                c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '@'
+            }
+        {
+            start -= 1;
+        }
+        let mut end = cursor.1.min(chars.len());
+        while end < chars.len()
+            && {
+                let c = chars[end];
+                c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '@'
+            }
+        {
+            end += 1;
+        }
+        if start == end {
+            self.status = "Sin palabra bajo cursor".to_owned();
+            return;
+        }
+        let word: String = chars[start..end].iter().collect();
+        let word_lower = word.to_ascii_lowercase();
+        let current_db = self
+            .active_database()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        for entry in &self.search_index {
+            if entry.entry.database.to_ascii_lowercase() != current_db && !current_db.is_empty() {
+                continue;
+            }
+            if entry.entry.name.to_ascii_lowercase() == word_lower {
+                let kind = match entry.entry.kind {
+                    crate::catalog::CatalogEntryKind::Table => "Tabla",
+                    crate::catalog::CatalogEntryKind::Procedure => "Procedimiento",
+                    crate::catalog::CatalogEntryKind::Function => "Función",
+                    crate::catalog::CatalogEntryKind::Database => "Base",
+                };
+                let owner = entry.entry.owner.as_deref().unwrap_or("dbo");
+                let mut msg = format!(
+                    "{}: {}.{} · {} [{}]",
+                    kind, owner, entry.entry.name, entry.entry.database, entry.entry.connection_name
+                );
+                if let Some(meta) = self.table_metadata.as_ref() {
+                    if meta.identifier.name.eq_ignore_ascii_case(&word) {
+                        msg = format!("{} · {} columnas", msg, meta.columns.len());
+                    }
+                }
+                self.status = msg;
+                return;
+            }
+        }
+        if let Some(meta) = self.table_metadata.as_ref() {
+            if let Some(col) = meta
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&word))
+            {
+                self.status = format!(
+                    "Columna: {} · {} · {} · {}",
+                    col.name,
+                    col.data_type,
+                    if col.nullable { "NULL" } else { "NOT NULL" },
+                    meta.identifier.qualified_name()
+                );
+                return;
+            }
+        }
+        const KEYWORDS: &[&str] = &[
+            "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "ON", "GROUP BY",
+            "ORDER BY", "HAVING", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "EXEC",
+            "EXECUTE", "DECLARE", "SET", "IF", "BEGIN", "END", "CASE", "WHEN", "THEN", "ELSE",
+            "AND", "OR", "NOT", "NULL", "IS", "IN", "BETWEEN", "LIKE", "EXISTS", "UNION", "ALL",
+            "TOP", "DISTINCT",
+        ];
+        if KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(&word)) {
+            self.status = format!("Keyword T-SQL: {}", word.to_uppercase());
+            return;
+        }
+        self.status = format!("Sin información para '{}'", word);
+    }
+
+    fn build_editor_completions(
+        &self,
+        qualifier: Option<&str>,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
+        let lower_prefix = prefix.to_ascii_lowercase();
+        let mut items: Vec<CompletionItem> = Vec::new();
+        let current_db = self
+            .active_database()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if let Some(qual) = qualifier {
+            let qual_lower = qual.to_ascii_lowercase();
+            if let Some(meta) = self.table_metadata.as_ref() {
+                let table_name = meta.identifier.name.to_ascii_lowercase();
+                let schema = meta.identifier.schema.to_ascii_lowercase();
+                let full = format!("{}.{}", schema, table_name);
+                let qual_is_table = qual_lower == table_name || qual_lower == full || qual_lower == schema;
+                if qual_is_table {
+                    for col in &meta.columns {
+                        let col_lower = col.name.to_ascii_lowercase();
+                        let matches = lower_prefix.is_empty()
+                            || col_lower.starts_with(&lower_prefix)
+                            || (lower_prefix.len() >= 2 && col_lower.contains(&lower_prefix));
+                        if matches {
+                            items.push(CompletionItem {
+                                label: col.name.clone(),
+                                insert_text: col.name.clone(),
+                                detail: format!(
+                                    "{} {}",
+                                    col.data_type,
+                                    if col.nullable { "NULL" } else { "NOT NULL" }
+                                ),
+                            });
+                        }
+                    }
+                    if lower_prefix.is_empty() || "*".starts_with(&lower_prefix) {
+                        items.push(CompletionItem {
+                            label: "*".to_string(),
+                            insert_text: "*".to_string(),
+                            detail: "todas las columnas".to_string(),
+                        });
+                    }
+                    if !items.is_empty() {
+                        items.sort_by(|a, b| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()));
+                        items.truncate(30);
+                        return items;
+                    }
+                }
+            }
+            return items;
+        }
+        const KEYWORDS: &[&str] = &[
+            "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "ON", "GROUP BY",
+            "ORDER BY", "HAVING", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "EXEC",
+            "EXECUTE", "DECLARE", "SET", "IF", "BEGIN", "END", "CASE", "WHEN", "THEN", "ELSE",
+            "AND", "OR", "NOT", "NULL", "IS", "IN", "BETWEEN", "LIKE", "EXISTS", "UNION", "ALL",
+            "TOP", "DISTINCT",
+        ];
+        for kw in KEYWORDS {
+            let kw_lower = kw.to_ascii_lowercase();
+            let matches = lower_prefix.is_empty()
+                || kw_lower.starts_with(&lower_prefix)
+                || (lower_prefix.len() >= 2 && kw_lower.contains(&lower_prefix));
+            if matches {
+                items.push(CompletionItem {
+                    label: kw.to_string(),
+                    insert_text: kw.to_string(),
+                    detail: "keyword".to_string(),
+                });
+            }
+        }
+        for entry in &self.search_index {
+            if !current_db.is_empty() && entry.entry.database.to_ascii_lowercase() != current_db {
+                continue;
+            }
+            match entry.entry.kind {
+                crate::catalog::CatalogEntryKind::Table
+                | crate::catalog::CatalogEntryKind::Procedure
+                | crate::catalog::CatalogEntryKind::Function => {}
+                _ => continue,
+            }
+            let name = &entry.entry.name;
+            let name_lower = name.to_ascii_lowercase();
+            let matches = lower_prefix.is_empty()
+                || name_lower.starts_with(&lower_prefix)
+                || (lower_prefix.len() >= 2 && name_lower.contains(&lower_prefix));
+            if matches {
+                let kind_label = match entry.entry.kind {
+                    crate::catalog::CatalogEntryKind::Table => "Tabla",
+                    crate::catalog::CatalogEntryKind::Procedure => "Proc",
+                    crate::catalog::CatalogEntryKind::Function => "Func",
+                    _ => "",
+                };
+                let owner = entry.entry.owner.as_deref().unwrap_or("");
+                let label = if owner.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}.{}", owner, name)
+                };
+                items.push(CompletionItem {
+                    label: label.clone(),
+                    insert_text: name.clone(),
+                    detail: format!("{} · {}", kind_label, entry.entry.database),
+                });
+            }
+            if items.len() >= 100 {
+                break;
+            }
+        }
+        let mut seen_owners = std::collections::HashSet::new();
+        for entry in &self.search_index {
+            if !current_db.is_empty() && entry.entry.database.to_ascii_lowercase() != current_db {
+                continue;
+            }
+            if let Some(owner) = &entry.entry.owner {
+                let owner_lower = owner.to_ascii_lowercase();
+                if seen_owners.contains(&owner_lower) {
+                    continue;
+                }
+                let matches = lower_prefix.is_empty()
+                    || owner_lower.starts_with(&lower_prefix)
+                    || (lower_prefix.len() >= 2 && owner_lower.contains(&lower_prefix));
+                if matches {
+                    seen_owners.insert(owner_lower);
+                    items.push(CompletionItem {
+                        label: owner.clone(),
+                        insert_text: owner.clone(),
+                        detail: "schema".to_string(),
+                    });
+                }
+            }
+        }
+        items.sort_by(|a, b| {
+            let a_lower = a.label.to_ascii_lowercase();
+            let b_lower = b.label.to_ascii_lowercase();
+            let a_exact = a_lower == lower_prefix;
+            let b_exact = b_lower == lower_prefix;
+            if a_exact != b_exact {
+                return b_exact.cmp(&a_exact);
+            }
+            let a_starts = a_lower.starts_with(&lower_prefix);
+            let b_starts = b_lower.starts_with(&lower_prefix);
+            if a_starts != b_starts {
+                return b_starts.cmp(&a_starts);
+            }
+            a_lower.cmp(&b_lower)
+        });
+        items.truncate(20);
+        items
     }
 
     fn handle_table_key(&mut self, key: KeyEvent) {
@@ -4407,6 +4777,38 @@ fn contains_executable_table_sql(sql: &str) -> bool {
             .iter()
             .any(|expected| keyword.eq_ignore_ascii_case(expected))
     })
+}
+
+fn extract_completion_context(line: &str, col: usize) -> (Option<String>, String) {
+    let chars: Vec<char> = line.chars().collect();
+    let col = col.min(chars.len());
+    let mut prefix_start = col;
+    while prefix_start > 0 {
+        let c = chars[prefix_start - 1];
+        if c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '@' {
+            prefix_start -= 1;
+        } else {
+            break;
+        }
+    }
+    let prefix: String = chars[prefix_start..col].iter().collect();
+    if prefix_start > 0 && chars[prefix_start - 1] == '.' {
+        let dot_pos = prefix_start - 1;
+        let mut qs = dot_pos;
+        while qs > 0 {
+            let c = chars[qs - 1];
+            if c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '@' {
+                qs -= 1;
+            } else {
+                break;
+            }
+        }
+        let qualifier: String = chars[qs..dot_pos].iter().collect();
+        if !qualifier.is_empty() {
+            return (Some(qualifier), prefix);
+        }
+    }
+    (None, prefix)
 }
 
 fn table_execution_committed(output: &SqlOutput) -> bool {

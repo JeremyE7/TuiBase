@@ -50,6 +50,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_table_copy_overlay(frame, app);
     }
 
+    if app.mode == AppMode::Editor && app.editor_completion.is_some() {
+        render_editor_completion(frame, app);
+    }
+
     if app.mode == AppMode::Table && app.current_execution_error_modal().is_some() {
         render_execution_error_modal(frame, app);
     }
@@ -1249,6 +1253,45 @@ fn apply_editor_selection(
     Text::from(out_lines)
 }
 
+fn render_editor_completion(frame: &mut Frame<'_>, app: &App) {
+    let Some(comp) = &app.editor_completion else {
+        return;
+    };
+    let area = centered_rect(56, 42, frame.area());
+    frame.render_widget(Clear, area);
+    let title = if let Some(qual) = &comp.qualifier {
+        format!(" Completado · {}.{} ", qual, comp.prefix)
+    } else if comp.prefix.is_empty() {
+        " Completado ".to_string()
+    } else {
+        format!(" Completado · '{}' ", comp.prefix)
+    };
+    let block = panel_block(title, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let items: Vec<ListItem> = comp
+        .suggestions
+        .iter()
+        .map(|item| {
+            let line = Line::from(vec![
+                Span::styled(item.label.clone(), Style::default().fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::styled(item.detail.clone(), Style::default().fg(Color::DarkGray)),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(comp.selected.min(items.len().saturating_sub(1))));
+    }
+    let list = List::new(items)
+        .block(Block::default())
+        .highlight_symbol("▸ ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
+    frame.render_stateful_widget(list, inner, &mut state);
+}
+
 fn render_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1434,6 +1477,7 @@ fn render_help(frame: &mut Frame<'_>) {
         "  dd/yy/p       cortar/copiar/pegar  u/Ctrl+r   deshacer/rehacer",
         "  v             selección visual    Ctrl+S     ejecutar/guardar",
         "  PgUp/PgDn/Home/End  desplazar consola  Ctrl+y copiar · Ctrl+Shift+L limpiar",
+        "  Ctrl+Space/Ctrl+n   completar         K (Normal) hover info",
         "",
         "SEGURIDAD",
         "  RO bloquea DDL/DML. En RW, toda escritura requiere confirmación.",

@@ -65,6 +65,10 @@ impl VimEditor {
         self.dirty = false;
     }
 
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     pub fn key_buffer(&self) -> &str {
         &self.key_buffer
     }
