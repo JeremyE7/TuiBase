@@ -128,6 +128,7 @@ pub enum WorkerResponse {
         connection_index: usize,
         database: String,
         result: Result<SqlOutput, String>,
+        elapsed_ms: u64,
     },
     CatalogRefreshed {
         request_id: u64,
@@ -288,14 +289,20 @@ fn execute_request(request: WorkerRequest) -> WorkerResponse {
             sql,
             profile,
         } => {
-            let result = with_backend(&profile, |backend| {
+            let start = std::time::Instant::now();
+            let mut result = with_backend(&profile, |backend| {
                 backend.execute(&profile, &database, &sql)
             });
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            if let Ok(output) = result.as_mut() {
+                output.elapsed_ms = elapsed_ms;
+            }
             WorkerResponse::SqlExecuted {
                 request_id,
                 connection_index,
                 database,
                 result,
+                elapsed_ms,
             }
         }
         WorkerRequest::RefreshCatalog {

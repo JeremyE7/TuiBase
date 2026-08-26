@@ -93,6 +93,7 @@ impl IsqlBackend {
             stdout,
             stderr,
             success: output.status.success() && !sql_error,
+            elapsed_ms: 0,
         })
     }
 
@@ -561,12 +562,38 @@ fn keyset_cursor_values(
 }
 
 fn parse_fields(value: &str) -> Vec<String> {
-    value
-        .trim_end_matches('|')
-        .split('|')
-        .map(str::trim)
-        .map(ToOwned::to_owned)
-        .collect()
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut escaped = false;
+
+    for character in value.chars() {
+        if escaped {
+            match character {
+                '\\' => field.push('\\'),
+                '|' => field.push('|'),
+                'r' => field.push('\r'),
+                'n' => field.push('\n'),
+                other => {
+                    field.push('\\');
+                    field.push(other);
+                }
+            }
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '|' {
+            fields.push(field.trim().to_owned());
+            field.clear();
+        } else {
+            field.push(character);
+        }
+    }
+
+    if escaped {
+        field.push('\\');
+    }
+    fields.push(field.trim().to_owned());
+    fields
 }
 
 fn marker_payload<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
@@ -590,10 +617,11 @@ fn clean_text_chunk(mut chunk: String) -> String {
 mod tests {
     use crate::db::models::{IndexMetadata, TableIdentifier};
     use crate::db::query::SortSpec;
+    use crate::db::sybase::queries;
 
     use super::{
-        format_column_type, keyset_cursor_values, parse_sp_helpindex, parse_table_metadata,
-        quote_display_identifier,
+        format_column_type, keyset_cursor_values, parse_fields, parse_sp_helpindex,
+        parse_table_metadata, parse_table_preview, quote_display_identifier,
     };
 
     #[test]
@@ -610,6 +638,28 @@ mod tests {
     fn quotes_display_identifiers() {
         assert_eq!(quote_display_identifier("order"), "\"order\"");
         assert_eq!(quote_display_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn parses_escaped_wire_fields_without_splitting_values() {
+        assert_eq!(
+            parse_fields(r"alpha\|beta\\gamma\r\nomega|tail"),
+            vec!["alpha|beta\\gamma\r\nomega", "tail"]
+        );
+    }
+
+    #[test]
+    fn accepts_pipes_and_newlines_inside_preview_values() {
+        let output = format!(
+            "{}name|notes\n{}one\\|two|line\\nnext\n",
+            queries::header_marker(),
+            queries::row_marker(),
+        );
+
+        let preview = parse_table_preview(&output).expect("valid encoded preview");
+
+        assert_eq!(preview.columns, ["name", "notes"]);
+        assert_eq!(preview.rows, vec![vec!["one|two", "line\nnext"]]);
     }
 
     #[test]

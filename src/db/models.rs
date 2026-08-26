@@ -181,6 +181,7 @@ pub struct SqlOutput {
     pub stdout: String,
     pub stderr: String,
     pub success: bool,
+    pub elapsed_ms: u64,
 }
 
 impl SqlOutput {

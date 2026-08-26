@@ -79,11 +79,33 @@ pub fn object_definition(object: &DbObject) -> String {
     );
 }
 
+fn wire_escape_field(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+fn wire_escape_sql(expression: &str) -> String {
+    format!(
+        "str_replace(str_replace(str_replace(str_replace({expression}, char(92), char(92) + char(92)), char(124), char(92) + char(124)), char(13), char(92) + 'r'), char(10), char(92) + 'n')"
+    )
+}
+
+fn preview_value_expression(identifier: &str, data_type: &str) -> String {
+    let expression = match data_type.to_ascii_lowercase().as_str() {
+        "image" => format!("case when {identifier} is null then '<NULL>' else '<IMAGE>' end"),
+        _ => format!("isnull(convert(varchar(255), {identifier}), '<NULL>')"),
+    };
+    wire_escape_sql(&expression)
+}
+
 pub fn preview_table(object: &DbObject, row_limit: usize, columns: &[(String, String)]) -> String {
     let table = qualified_identifier(&object.owner, &object.name);
     let header = columns
         .iter()
-        .map(|(name, _)| name.as_str())
+        .map(|(name, _)| wire_escape_field(name))
         .collect::<Vec<_>>()
         .join("|");
 
@@ -91,22 +113,7 @@ pub fn preview_table(object: &DbObject, row_limit: usize, columns: &[(String, St
 
     let row_expression = columns
         .iter()
-        .map(|(column, data_type)| {
-            let identifier = quote_identifier(column);
-
-            match data_type.to_ascii_lowercase().as_str() {
-                "image" => {
-                    format!(
-                        "case when {identifier} is null \
-                     then '<NULL>' \
-                     else '<IMAGE>' end"
-                    )
-                }
-                _ => {
-                    format!("isnull(convert(varchar(255), {identifier}), '<NULL>')")
-                }
-            }
-        })
+        .map(|(column, data_type)| preview_value_expression(&quote_identifier(column), data_type))
         .collect::<Vec<_>>()
         .join(" + '|' + ");
     return format!(
@@ -132,7 +139,7 @@ fn table_definition(object: &DbObject) -> String {
               + convert(varchar(20), isnull(c.prec, 0)) + '|'\n\
               + convert(varchar(20), isnull(c.scale, 0)) + '|'\n\
               + case when convert(int, c.status) & 8 = 8 then 'NULL' else 'NOT NULL' end\n\
-         from syscolumns c, systypes t, sysobjects o\n\
+         from syscolumns c, (select a.usertype, isnull((select max(d.local_type_name) from sybsystemprocs.dbo.spt_datatype_info d where d.ss_dtype = a.type), a.name) name from systypes a) t, sysobjects o\n\
          where c.id = o.id\n\
            and c.usertype = t.usertype\n\
            and o.name = '{name}'\n\
@@ -160,7 +167,7 @@ pub fn table_columns(object: &DbObject) -> String {
     return format!(
         "set nocount on\n\
          select '{ROW_MARKER}' + rtrim(c.name) + '|' + rtrim(t.name)\n\
-         from syscolumns c, systypes t, sysobjects o\n\
+         from syscolumns c, (select a.usertype, isnull((select max(d.local_type_name) from sybsystemprocs.dbo.spt_datatype_info d where d.ss_dtype = a.type), a.name) name from systypes a) t, sysobjects o\n\
          where c.id = o.id\n\
            and c.usertype = t.usertype
            and o.name = '{name}'\n\
@@ -183,7 +190,7 @@ pub fn table_metadata(object: &DbObject) -> String {
               + convert(varchar(20), isnull(c.scale, 0)) + '|'\n\
               + case when convert(int, c.status) & 8 = 8 then '1' else '0' end + '|'\n\
               + convert(varchar(20), c.colid)\n\
-         from syscolumns c, systypes t, sysobjects o\n\
+         from syscolumns c, (select a.usertype, isnull((select max(d.local_type_name) from sybsystemprocs.dbo.spt_datatype_info d where d.ss_dtype = a.type), a.name) name from systypes a) t, sysobjects o\n\
          where c.id = o.id\n\
            and c.usertype = t.usertype\n\
            and o.name = '{name}'\n\
@@ -266,7 +273,7 @@ pub fn query_table(
         header = string_literal(
             &columns
                 .iter()
-                .map(|(name, _)| name.as_str())
+                .map(|(name, _)| wire_escape_field(name))
                 .collect::<Vec<_>>()
                 .join("|"),
         ),
@@ -413,7 +420,7 @@ fn row_expression(columns: &[(String, String)]) -> String {
         .iter()
         .map(|(column, data_type)| {
             let identifier = quote_identifier(column);
-            match data_type.to_ascii_lowercase().as_str() {
+            let expression = match data_type.to_ascii_lowercase().as_str() {
                 "image" => {
                     format!("case when {identifier} is null then '<NULL>' else '<IMAGE>' end")
                 }
@@ -421,7 +428,8 @@ fn row_expression(columns: &[(String, String)]) -> String {
                     format!("case when {identifier} is null then '<NULL>' else '<TEXT>' end")
                 }
                 _ => format!("isnull(convert(varchar(255), {identifier}), '<NULL>')"),
-            }
+            };
+            wire_escape_sql(&expression)
         })
         .collect::<Vec<_>>()
         .join(" + '|' + ")
@@ -661,7 +669,7 @@ fn transactional_staged_sql(statements: &[String]) -> String {
         .join("\n\n");
 
     format!(
-        "-- Vista previa local de cambios staged; no se ha ejecutado SQL.\n-- La ejecución usa una transacción y solo confirma si todas las sentencias tienen éxito.\nset nocount on\nset quoted_identifier on\n\ndeclare @ase_tui_failed int\nselect @ase_tui_failed = 0\nbegin transaction\nif @@error <> 0\n    select @ase_tui_failed = 1\n\n{guarded_statements}\n\nif @ase_tui_failed = 0\nbegin\n    commit transaction\n    if @@error = 0\n        select '{STAGED_COMMITTED_MARKER}'\n    else\n    begin\n        rollback transaction\n        select '{STAGED_ROLLED_BACK_MARKER}'\n    end\nend\nelse\nbegin\n    rollback transaction\n    select '{STAGED_ROLLED_BACK_MARKER}'\nend\n"
+        "-- Vista previa local de cambios staged, no se ha ejecutado SQL.\n-- La ejecución usa una transacción y solo confirma si todas las sentencias tienen éxito.\nset nocount on\nset quoted_identifier on\n\ndeclare @ase_tui_failed int\nselect @ase_tui_failed = 0\nbegin transaction\nif @@error <> 0\n    select @ase_tui_failed = 1\n\n{guarded_statements}\n\nif @ase_tui_failed = 0\nbegin\n    commit transaction\n    if @@error = 0\n        select '{STAGED_COMMITTED_MARKER}'\n    else\n    begin\n        rollback transaction\n        select '{STAGED_ROLLED_BACK_MARKER}'\n    end\nend\nelse\nbegin\n    rollback transaction\n    select '{STAGED_ROLLED_BACK_MARKER}'\nend\n"
     )
 }
 
@@ -687,7 +695,7 @@ fn update_statement(
     }
     let where_clause = identity_where_clause(metadata, page, identity, row_index)?;
     Ok(format!(
-        "update {table}\nset {}\nwhere {where_clause};",
+        "update {table}\nset {}\nwhere {where_clause}",
         assignments.join(",\n    ")
     ))
 }
@@ -700,7 +708,7 @@ fn delete_statement(
     row_index: usize,
 ) -> Result<String, String> {
     let where_clause = identity_where_clause(metadata, page, identity, row_index)?;
-    Ok(format!("delete from {table}\nwhere {where_clause};"))
+    Ok(format!("delete from {table}\nwhere {where_clause}"))
 }
 
 fn insert_statement(
@@ -740,7 +748,7 @@ fn insert_statement(
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!(
-        "insert into {table} ({columns})\nvalues ({});",
+        "insert into {table} ({columns})\nvalues ({})",
         values.join(", ")
     ))
 }
@@ -893,15 +901,40 @@ mod tests {
     };
 
     use super::{
-        ObjectKind, keyset_pagination_supported, preview_staged_table_changes,
+        ObjectKind, keyset_pagination_supported, preview_staged_table_changes, preview_table,
         qualified_identifier, query_table, sql_value, staged_committed_marker,
-        staged_rolled_back_marker, string_literal, table_identifier, table_metadata,
-        validate_decimal_syntax,
+        staged_rolled_back_marker, string_literal, table_columns, table_identifier, table_metadata,
+        validate_decimal_syntax, wire_escape_field,
     };
 
     #[test]
     fn escapes_sql_literals() {
         assert_eq!(string_literal("O'Brien"), "O''Brien");
+    }
+
+    #[test]
+    fn escapes_wire_fields_without_colliding_with_delimiters() {
+        assert_eq!(wire_escape_field("a|b\\c\r\nd"), "a\\|b\\\\c\\r\\nd");
+    }
+
+    #[test]
+    fn escapes_preview_and_paged_row_values_before_serializing_them() {
+        let object = DbObject {
+            owner: "dbo".to_owned(),
+            name: "orders".to_owned(),
+            kind: ObjectKind::Table,
+        };
+        let columns = vec![("notes|label".to_owned(), "varchar".to_owned())];
+
+        let preview_sql = preview_table(&object, 10, &columns);
+        assert!(preview_sql.contains("notes\\|label"));
+        assert!(preview_sql.contains("str_replace"));
+        assert!(preview_sql.contains("char(124)"));
+
+        let query_sql =
+            query_table(&object, &TableQuery::default(), &columns, &[]).expect("valid query");
+        assert!(query_sql.contains("str_replace"));
+        assert!(query_sql.contains("char(13)"));
     }
 
     #[test]
@@ -977,14 +1010,18 @@ mod tests {
         assert!(preview.sql.contains(staged_rolled_back_marker()));
         assert!(preview.sql.contains("update \"dbo\".\"orders\""));
         assert!(preview.sql.contains("\"name\" = 'Grace'"));
-        assert!(preview.sql.contains("where \"id\" = 1;"));
+        assert!(!preview.sql.contains(';'));
+        assert!(!preview.sql.contains("where \"id\" = 1;"));
+        assert!(!preview.sql.contains("where \"id\" = 2;"));
+        assert!(!preview.sql.contains("values (3, 'New''Name', 12.50);"));
+        assert!(preview.sql.contains("where \"id\" = 1"));
         assert!(
             preview
                 .sql
-                .contains("delete from \"dbo\".\"orders\"\nwhere \"id\" = 2;")
+                .contains("delete from \"dbo\".\"orders\"\nwhere \"id\" = 2")
         );
         assert!(preview.sql.contains(
-            "insert into \"dbo\".\"orders\" (\"id\", \"name\", \"amount\")\nvalues (3, 'New''Name', 12.50);"
+            "insert into \"dbo\".\"orders\" (\"id\", \"name\", \"amount\")\nvalues (3, 'New''Name', 12.50)"
         ));
     }
 
@@ -1391,6 +1428,24 @@ mod tests {
         };
 
         assert_eq!(table_identifier(&object).qualified_name(), "dbo.orders");
+    }
+
+    #[test]
+    fn resolves_alias_types_to_base_types_in_metadata_queries() {
+        let object = DbObject {
+            owner: "dbo".to_owned(),
+            name: "orders".to_owned(),
+            kind: ObjectKind::Table,
+        };
+
+        let columns_sql = table_columns(&object);
+        assert!(columns_sql.contains("rtrim(t.name)"));
+        assert!(columns_sql.contains("c.usertype = t.usertype"));
+
+        let metadata_sql = table_metadata(&object);
+        assert!(metadata_sql.contains(
+            "(select a.usertype, isnull((select max(d.local_type_name) from sybsystemprocs.dbo.spt_datatype_info d where d.ss_dtype = a.type), a.name) name from systypes a) t"
+        ));
     }
 
     #[test]

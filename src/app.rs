@@ -215,6 +215,7 @@ enum ConfirmAction {
     ExecuteTableChanges { sql: String },
     DiscardEditor,
     DiscardTableChanges,
+    ReloadTableChanges,
 }
 
 pub struct App {
@@ -232,6 +233,8 @@ pub struct App {
     pub content: String,
     pub highlighted_content: Option<Text<'static>>,
     pub content_scroll: u16,
+    pub console_elapsed_ms: Option<u64>,
+    pub console_success: Option<bool>,
     pub status: String,
     pub last_key: String,
     pub editor: Option<EditorSession>,
@@ -264,6 +267,8 @@ pub struct App {
     pub table_changes_summary_scroll: u16,
     pub table_sql_preview: Option<sybase::queries::TableSqlPreview>,
     pub table_sql_preview_scroll: u16,
+    pub execution_error_modal: Option<String>,
+    pub execution_error_scroll: u16,
     search_return_mode: AppMode,
     help_return_mode: AppMode,
     search: Option<SearchSession>,
@@ -316,6 +321,8 @@ impl App {
             content: "Pulsa Enter sobre una conexión para comenzar. '?' abre la ayuda.".to_owned(),
             highlighted_content: None,
             content_scroll: 0,
+            console_elapsed_ms: None,
+            console_success: None,
             status: "Listo".to_owned(),
             table_page: None,
             table_metadata: None,
@@ -344,6 +351,8 @@ impl App {
             table_changes_summary_scroll: 0,
             table_sql_preview: None,
             table_sql_preview_scroll: 0,
+            execution_error_modal: None,
+            execution_error_scroll: 0,
             search_return_mode: AppMode::Browser,
             help_return_mode: AppMode::Browser,
             filter_session: None,
@@ -423,6 +432,10 @@ impl App {
 
     pub fn current_table_sql_preview(&self) -> Option<&sybase::queries::TableSqlPreview> {
         self.table_sql_preview.as_ref()
+    }
+
+    pub fn current_execution_error_modal(&self) -> Option<&str> {
+        self.execution_error_modal.as_deref()
     }
 
     pub fn table_cell_draft_value(&self, row_index: usize, column: &str) -> Option<&str> {
@@ -594,6 +607,50 @@ impl App {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::PageUp) {
+            self.content_scroll = self.content_scroll.saturating_sub(8);
+            self.status = format!("Consola · scroll {}", self.content_scroll);
+            return;
+        }
+        if matches!(key.code, KeyCode::PageDown) {
+            self.content_scroll = self.content_scroll.saturating_add(8);
+            self.status = format!("Consola · scroll {}", self.content_scroll);
+            return;
+        }
+        if matches!(key.code, KeyCode::Home) {
+            self.content_scroll = 0;
+            self.status = "Consola · arriba".to_owned();
+            return;
+        }
+        if matches!(key.code, KeyCode::End) {
+            self.content_scroll = u16::MAX;
+            self.status = "Consola · abajo".to_owned();
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
+            if self.content.is_empty() {
+                self.status = "Consola vacía".to_owned();
+            } else {
+                match crate::services::clipboard::copy_text(&self.content) {
+                    Ok(()) => {
+                        self.status = format!("Consola copiada · {} líneas", self.content.lines().count());
+                    }
+                    Err(e) => self.status = format!("ERROR al copiar consola: {e}"),
+                }
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('L') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.content.clear();
+            self.content_title = "Consola".to_owned();
+            self.content_scroll = 0;
+            self.highlighted_content = None;
+            self.console_elapsed_ms = None;
+            self.console_success = None;
+            self.status = "Consola limpiada".to_owned();
+            return;
+        }
+
         let command = match self.editor.as_mut() {
             Some(session) => session.editor.handle_key(key),
             None => {
@@ -625,6 +682,11 @@ impl App {
     }
 
     fn handle_table_key(&mut self, key: KeyEvent) {
+        if self.execution_error_modal.is_some() {
+            self.handle_execution_error_modal_key(key);
+            return;
+        }
+
         if self.table_date_time_picker.is_some() {
             self.handle_table_date_time_picker_key(key);
             return;
@@ -759,6 +821,11 @@ impl App {
 
         if key.code == KeyCode::Char('F') {
             self.clear_table_filter();
+            return;
+        }
+
+        if key.code == KeyCode::Char('r') {
+            self.reload_table_page();
             return;
         }
 
@@ -1189,6 +1256,32 @@ impl App {
             }
             KeyCode::Home | KeyCode::Char('g') => self.table_sql_preview_scroll = 0,
             KeyCode::End | KeyCode::Char('G') => self.table_sql_preview_scroll = u16::MAX,
+            _ => {}
+        }
+    }
+
+    fn handle_execution_error_modal_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.execution_error_modal = None;
+                self.execution_error_scroll = 0;
+                self.status =
+                    "Error de ejecución cerrado · los cambios staged se conservaron".to_owned();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.execution_error_scroll = self.execution_error_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.execution_error_scroll = self.execution_error_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.execution_error_scroll = self.execution_error_scroll.saturating_sub(8);
+            }
+            KeyCode::PageDown => {
+                self.execution_error_scroll = self.execution_error_scroll.saturating_add(8);
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.execution_error_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.execution_error_scroll = u16::MAX,
             _ => {}
         }
     }
@@ -2862,6 +2955,11 @@ impl App {
                             self.status = "Cambios de tabla descartados".to_owned();
                         }
                     }
+                    ConfirmAction::ReloadTableChanges => {
+                        self.reset_table_page();
+                        self.load_table_query_page("Recargando tabla...");
+                        self.mode = AppMode::Table;
+                    }
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
@@ -2870,6 +2968,7 @@ impl App {
                         action,
                         ConfirmAction::DiscardTableChanges
                             | ConfirmAction::ExecuteTableChanges { .. }
+                            | ConfirmAction::ReloadTableChanges
                     )
                 });
                 self.confirm_action = None;
@@ -3146,6 +3245,23 @@ impl App {
         });
     }
 
+    fn reload_table_page(&mut self) {
+        if self.has_pending_table_changes() {
+            let draft_count = self.table_cell_drafts.len();
+            let deletion_count = self.table_row_deletions.len();
+            let new_row_count = self.table_new_rows.len();
+            self.confirm_action = Some(ConfirmAction::ReloadTableChanges);
+            self.confirm_message = format!(
+                "Recargar descartará {} borrador(es), {} fila(s) marcadas y {} fila(s) nuevas. ¿Continuar? [y/N]",
+                draft_count, deletion_count, new_row_count
+            );
+            self.mode = AppMode::Confirm;
+            return;
+        }
+        self.reset_table_page();
+        self.load_table_query_page("Recargando tabla...");
+    }
+
     fn load_next_table_page(&mut self) {
         let Some(page) = self.table_page.as_ref() else {
             return;
@@ -3380,44 +3496,64 @@ impl App {
         database: String,
         result: Result<SqlOutput, String>,
     ) {
+        let elapsed_suffix = self
+            .console_elapsed_ms
+            .map(|ms| format!(" · {ms}ms"))
+            .unwrap_or_default();
         match result {
             Ok(output) => {
                 let content = output.combined();
                 let committed = table_execution_committed(&output);
-                self.content_title = format!("Resultado · {database}");
+                self.content_title = format!("Resultado · {database}{elapsed_suffix}");
                 self.content_scroll = 0;
                 self.content = content.clone();
                 self.highlighted_content = None;
+                self.console_success = Some(output.success && committed);
                 if committed {
                     self.reset_table_page();
                     self.table_show_metadata = false;
                     self.mode = AppMode::Table;
-                    self.status =
-                        "Cambios ejecutados y confirmados · recargando tabla...".to_owned();
+                    self.status = format!(
+                        "Cambios ejecutados y confirmados{elapsed_suffix} · recargando tabla..."
+                    );
                     self.load_table_query_page("Recargando tabla después del commit...");
+                } else if !output.success {
+                    self.open_table_execution_error_modal(content);
                 } else {
                     self.mode = AppMode::Table;
                     self.status = if table_execution_rolled_back(&output) {
-                        "Transacción revertida · los cambios staged se conservaron".to_owned()
+                        format!("Transacción revertida{elapsed_suffix} · los cambios staged se conservaron")
                     } else if output.success {
-                        "No se confirmó el commit · los cambios staged se conservaron".to_owned()
+                        format!("No se confirmó el commit{elapsed_suffix} · los cambios staged se conservaron")
                     } else {
-                        "ASE/isql devolvió un error · los cambios staged se conservaron".to_owned()
+                        format!("ASE/isql devolvió un error{elapsed_suffix} · los cambios staged se conservaron")
                     };
                 }
             }
             Err(error) => {
-                self.content_title = "Error de ejecución".to_owned();
-                self.content_scroll = 0;
-                self.content = error.clone();
-                self.highlighted_content = None;
-                self.mode = AppMode::Table;
-                self.status = format!(
-                    "ERROR: {} · los cambios staged se conservaron",
-                    first_line(&error)
-                );
+                self.console_success = Some(false);
+                self.open_table_execution_error_modal(error);
             }
         }
+    }
+
+    fn open_table_execution_error_modal(&mut self, message: String) {
+        let elapsed_suffix = self
+            .console_elapsed_ms
+            .map(|ms| format!(" · {ms}ms"))
+            .unwrap_or_default();
+        self.content_title = format!("Error de ejecución{elapsed_suffix}");
+        self.content_scroll = 0;
+        self.content = message.clone();
+        self.highlighted_content = None;
+        self.execution_error_modal = Some(message);
+        self.execution_error_scroll = 0;
+        self.console_success = Some(false);
+        self.mode = AppMode::Table;
+        self.status = format!(
+            "ERROR: {} · los cambios staged se conservaron{elapsed_suffix} · Enter/Esc cierra",
+            first_line(self.execution_error_modal.as_deref().unwrap_or_default())
+        );
     }
 
     fn handle_worker_response(&mut self, response: WorkerResponse) {
@@ -3721,6 +3857,7 @@ impl App {
                 connection_index,
                 database,
                 result,
+                elapsed_ms,
                 ..
             } => {
                 if self.connection_index != connection_index
@@ -3728,7 +3865,9 @@ impl App {
                 {
                     return;
                 }
+                self.console_elapsed_ms = Some(elapsed_ms);
                 if self.return_to_table_after_execution {
+                    self.console_success = Some(result.as_ref().map(|o| o.success).unwrap_or(false));
                     self.handle_table_changes_execution_result(database, result);
                     self.return_to_table_after_execution = false;
                     self.busy_count = self.pending_requests.len();
@@ -3736,9 +3875,12 @@ impl App {
                 }
                 match result {
                     Ok(output) => {
-                        self.content_title = format!("Resultado · {database}");
+                        let elapsed = output.elapsed_ms.max(elapsed_ms);
+                        self.console_success = Some(output.success);
+                        let combined = output.combined();
+                        let line_count = combined.lines().count();
+                        self.content = combined;
                         self.content_scroll = 0;
-                        self.content = output.combined();
                         self.highlighted_content = None;
                         self.table_page = None;
                         self.table_metadata = None;
@@ -3747,16 +3889,36 @@ impl App {
                         self.sort_session = None;
                         self.column_search_session = None;
                         self.table_show_metadata = false;
+                        let status_icon = if output.success { "✓" } else { "✗" };
+                        self.content_title =
+                            format!("Consola · {database} · {elapsed}ms · {line_count} líneas {status_icon}");
                         if output.success {
                             if let Some(session) = self.editor.as_mut() {
                                 session.editor.mark_clean();
                             }
-                            self.status = "T-SQL ejecutado correctamente".to_owned();
+                            self.status =
+                                format!("T-SQL OK · {elapsed}ms · {line_count} líneas · {status_icon}");
                         } else {
-                            self.status = "ASE/isql devolvió un error".to_owned();
+                            self.status = format!("ASE/isql ERROR · {elapsed}ms {status_icon}");
                         }
                     }
-                    Err(error) => self.set_error(error),
+                    Err(error) => {
+                        self.console_success = Some(false);
+                        let line_count = error.lines().count();
+                        self.content = error.clone();
+                        self.content_scroll = 0;
+                        self.highlighted_content = None;
+                        self.table_page = None;
+                        self.table_metadata = None;
+                        self.table_filter_expression.clear();
+                        self.filter_session = None;
+                        self.sort_session = None;
+                        self.column_search_session = None;
+                        self.table_show_metadata = false;
+                        self.content_title =
+                            format!("Consola · {database} · {elapsed_ms}ms · {line_count} líneas ✗");
+                        self.status = format!("ERROR · {elapsed_ms}ms · {}", first_line(&error));
+                    }
                 }
                 self.mode = if self.return_to_editor_after_execution && self.editor.is_some() {
                     AppMode::Editor
@@ -4933,18 +5095,21 @@ fn shift_row_indexes(rows: &BTreeSet<usize>, removed_row: usize) -> BTreeSet<usi
 #[cfg(test)]
 mod tests {
     use super::{
-        TableCopySource, TableDateTimeKind, TableDraftChange, compact_table_summary_value,
-        contains_executable_table_sql, format_parsed_table_date_time, format_table_type,
-        is_write_sql, normalize_definition_for_edit, parse_table_date_time_value,
-        reorder_table_page, selected_table_value, shift_row_indexes, shifted_index,
-        store_table_cell_draft, table_copy_rows_text, table_copy_text, table_date_time_kind,
-        table_draft_exit_message, table_execution_committed, table_execution_rolled_back,
-        table_exit_message, table_filter_suggestions, table_sort_suggestions,
-        validate_table_cell_value,
+        App, AppMode, TableCellDraft, TableCopySource, TableDateTimeKind, TableDraftChange,
+        compact_table_summary_value, contains_executable_table_sql, format_parsed_table_date_time,
+        format_table_type, is_write_sql, normalize_definition_for_edit,
+        parse_table_date_time_value, reorder_table_page, selected_table_value, shift_row_indexes,
+        shifted_index, store_table_cell_draft, table_copy_rows_text, table_copy_text,
+        table_date_time_kind, table_draft_exit_message, table_execution_committed,
+        table_execution_rolled_back, table_exit_message, table_filter_suggestions,
+        table_sort_suggestions, validate_table_cell_value,
     };
+    use crate::config::{AppConfig, ConnectionProfile};
     use crate::db::models::{ColumnMetadata, SqlOutput, TablePage};
     use crate::db::query::PageCursor;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     #[test]
     fn detects_writes_conservatively() {
@@ -5271,16 +5436,19 @@ mod tests {
             ),
             stderr: String::new(),
             success: true,
+            elapsed_ms: 0,
         };
         let rolled_back = SqlOutput {
             stdout: crate::db::sybase::queries::staged_rolled_back_marker().to_owned(),
             stderr: String::new(),
             success: true,
+            elapsed_ms: 0,
         };
         let process_failed_with_commit_marker = SqlOutput {
             stdout: crate::db::sybase::queries::staged_committed_marker().to_owned(),
             stderr: String::new(),
             success: false,
+            elapsed_ms: 0,
         };
 
         assert!(table_execution_committed(&committed));
@@ -5289,6 +5457,54 @@ mod tests {
             &process_failed_with_commit_marker
         ));
         assert!(table_execution_rolled_back(&rolled_back));
+    }
+
+    #[test]
+    fn execution_error_modal_preserves_staged_changes_until_closed() {
+        let config = AppConfig {
+            connections: vec![ConnectionProfile {
+                name: "test".to_owned(),
+                backend: "sybase_isql".to_owned(),
+                isql_path: "isql".to_owned(),
+                userstore_key: Some("test".to_owned()),
+                server: None,
+                username: None,
+                password_env: None,
+                database: Some("master".to_owned()),
+                charset: None,
+                allow_writes: true,
+                extra_args: Vec::new(),
+            }],
+            catalog_ttl_hours: 24,
+        };
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (_response_tx, response_rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            config,
+            PathBuf::from("connections.toml"),
+            request_tx,
+            response_rx,
+        );
+        app.table_cell_drafts.push(TableCellDraft {
+            row_index: 0,
+            column: "name".to_owned(),
+            original_value: "Ada".to_owned(),
+            value: "Grace".to_owned(),
+        });
+
+        app.open_table_execution_error_modal("Msg 102: syntax error".to_owned());
+
+        assert_eq!(app.mode, AppMode::Table);
+        assert_eq!(
+            app.current_execution_error_modal(),
+            Some("Msg 102: syntax error")
+        );
+        assert_eq!(app.table_cell_drafts.len(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.current_execution_error_modal().is_none());
+        assert_eq!(app.table_cell_drafts.len(), 1);
     }
 
     #[test]

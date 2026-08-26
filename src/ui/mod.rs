@@ -50,6 +50,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_table_copy_overlay(frame, app);
     }
 
+    if app.mode == AppMode::Table && app.current_execution_error_modal().is_some() {
+        render_execution_error_modal(frame, app);
+    }
+
     match app.mode {
         AppMode::Confirm => render_confirmation(frame, app),
         AppMode::Help => render_help(frame),
@@ -1072,13 +1076,40 @@ fn render_editor(frame: &mut Frame<'_>, app: &App) {
         );
     }
 
-    let result = Paragraph::new(app.content.as_str())
+    let console = console_text(app);
+    let result = Paragraph::new(console)
         .block(panel_block(format!(" {} ", app.content_title), false))
         .wrap(Wrap { trim: false })
         .scroll((app.content_scroll, 0));
     frame.render_widget(result, editor_layout[1]);
 
     render_status(frame, vertical[1], app);
+}
+
+fn console_text(app: &App) -> Text<'static> {
+    if app.content.is_empty() {
+        return Text::from(Line::from(Span::styled(
+            "Consola lista · Ctrl+S ejecuta · PgUp/PgDn desplaza · Ctrl+y copia · Ctrl+Shift+L limpia",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for line in app.content.lines() {
+        let lower = line.to_ascii_lowercase();
+        let style = if lower.contains("msg ") && lower.contains("level")
+            || lower.contains("server message")
+            || lower.trim_start().starts_with("stderr")
+            || lower.trim_start().starts_with("msg ")
+        {
+            Style::default().fg(Color::LightRed)
+        } else if lower.contains("error") && app.console_success == Some(false) {
+            Style::default().fg(Color::LightRed)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(line.to_owned(), style)));
+    }
+    Text::from(lines)
 }
 
 fn render_list(
@@ -1203,6 +1234,33 @@ fn render_confirmation(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(message, area);
 }
 
+fn render_execution_error_modal(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(86, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "ASE rechazó la ejecución",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if let Some(error) = app.current_execution_error_modal() {
+        lines.extend(error.lines().map(|line| Line::from(line.to_owned())));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from("Los cambios staged se conservaron."),
+        Line::from("Enter/Esc cierra · j/k desplaza"),
+    ]);
+
+    let message = Paragraph::new(Text::from(lines))
+        .block(panel_block(" Error de ejecución ", true))
+        .wrap(Wrap { trim: false })
+        .scroll((app.execution_error_scroll, 0));
+    frame.render_widget(message, area);
+}
+
 fn render_help(frame: &mut Frame<'_>) {
     let area = centered_rect(84, 82, frame.area());
     frame.render_widget(Clear, area);
@@ -1227,6 +1285,7 @@ fn render_help(frame: &mut Frame<'_>) {
         "  c             buscar columna             p fijar/desfijar",
         "  f             filtro con autocompletado  F limpiar filtro",
         "  o             ordenar columnas           O limpiar orden",
+        "  r             recargar datos (respeta orden/filtro)",
         "  Ctrl+S        resumen de cambios staged",
         "  /             búsqueda global             ? ayuda · q salir",
         "",
@@ -1237,6 +1296,7 @@ fn render_help(frame: &mut Frame<'_>) {
         "  o/O           línea debajo/arriba x          borrar carácter",
         "  dd/yy/p       cortar/copiar/pegar  u/Ctrl+r   deshacer/rehacer",
         "  v             selección visual    Ctrl+S     ejecutar/guardar",
+        "  PgUp/PgDn/Home/End  desplazar consola  Ctrl+y copiar · Ctrl+Shift+L limpiar",
         "",
         "SEGURIDAD",
         "  RO bloquea DDL/DML. En RW, toda escritura requiere confirmación.",
