@@ -6,7 +6,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Table, Wrap,
+        ScrollbarOrientation, ScrollbarState, Table, Tabs, Wrap,
     },
 };
 
@@ -24,10 +24,21 @@ const TABLE_COLUMN_WIDTH: usize = 18;
 const TABLE_COLUMN_SPACING: usize = 1;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
+    let content_area = if app.tabs.is_empty() {
+        frame.area()
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(frame.area());
+        render_tabs_bar(frame, chunks[0], app);
+        chunks[1]
+    };
+
     match app.mode {
-        AppMode::Editor => render_editor(frame, app),
-        AppMode::Table => render_full_table(frame, app),
-        _ => render_browser(frame, app),
+        AppMode::Editor => render_editor(frame, content_area, app),
+        AppMode::Table => render_full_table(frame, content_area, app),
+        _ => render_browser(frame, content_area, app),
     }
 
     if app.mode == AppMode::Table && app.current_table_sql_preview().is_some() {
@@ -66,11 +77,42 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn render_browser(frame: &mut Frame<'_>, app: &App) {
+fn render_tabs_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if app.tabs.is_empty() {
+        return;
+    }
+    let titles: Vec<Line> = app
+        .tabs
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(idx, tab)| {
+            let prefix = if idx == app.tabs.active { "● " } else { "○ " };
+            Line::from(format!("{}{}", prefix, tab.short_title()))
+        })
+        .collect();
+    let tabs = Tabs::new(titles)
+        .select(app.tabs.active)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider(Span::raw(" │ "));
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(tabs, inner);
+}
+
+fn render_browser(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(1)])
-        .split(frame.area());
+        .split(area);
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
@@ -166,11 +208,11 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
     render_status(frame, vertical[1], app);
 }
 
-fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
+fn render_full_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(2), Constraint::Length(1)])
-        .split(frame.area());
+        .split(area);
     let table_area = areas[0];
     let scrollbar_area = areas[1];
 
@@ -184,7 +226,7 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_widget(
             Paragraph::new("Cargando metadata y datos de la tabla...")
                 .block(panel_block(" Tabla ", true)),
-            frame.area(),
+            area,
         );
         return;
     };
@@ -192,7 +234,7 @@ fn render_full_table(frame: &mut Frame<'_>, app: &mut App) {
     if page.columns.is_empty() {
         frame.render_widget(
             Paragraph::new("La tabla no tiene columnas").block(panel_block(" Tabla ", true)),
-            frame.area(),
+            area,
         );
         return;
     }
@@ -1046,11 +1088,11 @@ fn format_column_type(column: &crate::db::models::ColumnMetadata) -> String {
     }
 }
 
-fn render_editor(frame: &mut Frame<'_>, app: &mut App) {
+fn render_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(1)])
-        .split(frame.area());
+        .split(area);
 
     let editor_layout = Layout::default()
         .direction(Direction::Vertical)

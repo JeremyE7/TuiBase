@@ -6,6 +6,7 @@ use std::{
 
 use crate::catalog::{CatalogCache, CatalogEntry, SearchCatalogEntry, connection_key};
 use crate::db::models::{ColumnMetadata, TableMetadata, TablePage};
+use crate::tabs::TabsState;
 use crate::services;
 use crate::table_preferences::{TablePreferences, table_preference_key};
 use crate::ui;
@@ -294,6 +295,7 @@ pub struct App {
     column_search_session: Option<ColumnSearchSession>,
     pub editor_completion: Option<EditorCompletionSession>,
     column_cache: HashMap<String, Vec<ColumnMetadata>>,
+    pub tabs: TabsState,
     active_search: Option<String>,
     catalog: CatalogCache,
     search_index: Vec<SearchCatalogEntry>,
@@ -379,6 +381,7 @@ impl App {
             column_search_session: None,
             editor_completion: None,
             column_cache: HashMap::new(),
+            tabs: TabsState::load().unwrap_or_default(),
             last_key: String::new(),
             editor: None,
             should_quit: false,
@@ -533,6 +536,9 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.last_key = format_key(key);
+        if self.handle_tab_key(key) {
+            return;
+        }
         match self.mode {
             AppMode::Browser => self.handle_browser_key(key),
             AppMode::Editor => self.handle_editor_key(key),
@@ -550,16 +556,156 @@ impl App {
         }
     }
 
+    fn handle_tab_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+Tab next, Ctrl+Shift+Tab (BackTab) prev
+        if ctrl && key.code == KeyCode::Tab {
+            self.next_tab();
+            return true;
+        }
+        if ctrl && key.code == KeyCode::BackTab {
+            self.prev_tab();
+            return true;
+        }
+        // Ctrl+w close tab
+        if ctrl && key.code == KeyCode::Char('w') {
+            self.close_current_tab();
+            return true;
+        }
+        // Ctrl+h/l for left/right, but not in editor Insert mode
+        let in_editor_insert = self.mode == AppMode::Editor
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|s| s.editor.mode == crate::editor::VimMode::Insert);
+        if !in_editor_insert {
+            if ctrl && key.code == KeyCode::Char('l') {
+                self.next_tab();
+                return true;
+            }
+            if ctrl && key.code == KeyCode::Char('h') {
+                self.prev_tab();
+                return true;
+            }
+            // Backspace with ctrl is often Ctrl+h
+            if ctrl && key.code == KeyCode::Backspace {
+                self.prev_tab();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn next_tab(&mut self) {
+        if self.tabs.is_empty() {
+            self.status = "No hay tabs".to_owned();
+            return;
+        }
+        self.tabs.next();
+        let _ = self.tabs.save();
+        self.load_active_tab();
+    }
+
+    fn prev_tab(&mut self) {
+        if self.tabs.is_empty() {
+            self.status = "No hay tabs".to_owned();
+            return;
+        }
+        self.tabs.prev();
+        let _ = self.tabs.save();
+        self.load_active_tab();
+    }
+
+    fn close_current_tab(&mut self) {
+        if self.tabs.is_empty() {
+            self.status = "No hay tabs para cerrar".to_owned();
+            return;
+        }
+        let title = self
+            .tabs
+            .active()
+            .map(|t| t.title())
+            .unwrap_or_default();
+        self.tabs.close_active();
+        let _ = self.tabs.save();
+        if self.tabs.is_empty() {
+            self.status = format!("Tab cerrada · {title} · sin tabs");
+            self.content = "Pulsa Enter sobre un objeto para abrir una nueva tab".to_owned();
+            self.content_title = "Sin tabs".to_owned();
+            self.mode = AppMode::Browser;
+        } else {
+            self.status = format!("Tab cerrada · {title}");
+            self.load_active_tab();
+        }
+    }
+
+    fn open_tab_for_current_object(&mut self) {
+        let Some(object) = self.current_object().cloned() else {
+            self.set_error("Selecciona un objeto".to_owned());
+            return;
+        };
+        let Some(database) = self.current_database().map(|s| s.to_owned()) else {
+            self.set_error("Selecciona una base de datos".to_owned());
+            return;
+        };
+        self.tabs.push(database.clone(), &object);
+        let _ = self.tabs.save();
+        self.load_tab_by_object(database, object);
+    }
+
+    fn load_active_tab(&mut self) {
+        let Some(tab) = self.tabs.active().cloned() else {
+            return;
+        };
+        self.load_tab_by_object(tab.database.clone(), tab.to_object());
+    }
+
+    fn load_tab_by_object(&mut self, database: String, object: DbObject) {
+        if object.kind == ObjectKind::Table {
+            let Some(profile) = self.current_profile().cloned() else {
+                return;
+            };
+            let connection_index = self.connection_index;
+            let request_id = self.begin_request(format!("Consultando {}...", object.qualified_name()));
+            self.clear_table_cell_editing();
+            self.table_metadata = None;
+            self.table_page = None;
+            self.table_query = TableQuery::new(PageRequest::default());
+            self.table_filter_expression.clear();
+            self.filter_session = None;
+            self.sort_session = None;
+            self.column_search_session = None;
+            self.table_loading_more = false;
+            self.current_content_object = Some(object.clone());
+            self.send(WorkerRequest::LoadTableMetadata {
+                request_id,
+                connection_index,
+                database,
+                object,
+                profile,
+            });
+        } else {
+            let Some(profile) = self.current_profile().cloned() else {
+                return;
+            };
+            let connection_index = self.connection_index;
+            let request_id = self.begin_request(format!("Leyendo {}...", object.qualified_name()));
+            self.send(WorkerRequest::LoadDefinition {
+                request_id,
+                connection_index,
+                database,
+                object,
+                profile,
+            });
+        }
+    }
+
     fn handle_browser_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
-            self.status = "Búsqueda global: usa / para buscar en el catálogo".to_owned();
-            return;
-        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Tab => self.focus = self.focus.next(),
@@ -3452,11 +3598,7 @@ impl App {
             }
             Focus::Databases | Focus::Kinds => self.load_objects(),
             Focus::Objects => {
-                if self.current_kind() == ObjectKind::Table {
-                    self.preview_selected_table();
-                } else {
-                    self.load_definition(false);
-                }
+                self.open_tab_for_current_object();
             }
             Focus::Content => {}
         }

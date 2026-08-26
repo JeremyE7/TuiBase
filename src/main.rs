@@ -6,6 +6,7 @@ mod editor;
 mod search;
 mod services;
 mod table_preferences;
+mod tabs;
 mod ui;
 mod worker;
 
