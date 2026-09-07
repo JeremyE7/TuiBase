@@ -143,6 +143,7 @@ pub enum FilterOperator {
 pub enum FilterParseError {
     Empty,
     UnclosedQuote,
+    MissingClosingParenthesis,
     MissingColumn,
     UnknownColumn(String),
     MissingOperator(String),
@@ -155,6 +156,7 @@ impl fmt::Display for FilterParseError {
         match self {
             Self::Empty => f.write_str("el filtro está vacío"),
             Self::UnclosedQuote => f.write_str("hay una comilla sin cerrar"),
+            Self::MissingClosingParenthesis => f.write_str("falta cerrar un paréntesis"),
             Self::MissingColumn => f.write_str("falta el nombre de la columna"),
             Self::UnknownColumn(column) => write!(f, "columna desconocida: {column}"),
             Self::MissingOperator(condition) => {
@@ -189,19 +191,47 @@ impl FilterSpec {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterExpr {
+    Condition(FilterSpec),
+    And(Vec<FilterExpr>),
+    Or(Vec<FilterExpr>),
+    Not(Box<FilterExpr>),
+}
+
+impl FilterExpr {
+    fn combine_and(left: Self, right: Self) -> Self {
+        let mut terms = Vec::new();
+        match left {
+            Self::And(items) => terms.extend(items),
+            item => terms.push(item),
+        }
+        match right {
+            Self::And(items) => terms.extend(items),
+            item => terms.push(item),
+        }
+        Self::And(terms)
+    }
+
+    fn combine_or(left: Self, right: Self) -> Self {
+        let mut terms = Vec::new();
+        match left {
+            Self::Or(items) => terms.extend(items),
+            item => terms.push(item),
+        }
+        match right {
+            Self::Or(items) => terms.extend(items),
+            item => terms.push(item),
+        }
+        Self::Or(terms)
+    }
+}
+
 pub fn parse_filter_expression(
     expression: &str,
     columns: &[String],
-) -> Result<Vec<FilterSpec>, FilterParseError> {
-    let expression = expression.trim();
-    if expression.is_empty() {
-        return Err(FilterParseError::Empty);
-    }
-
-    split_filter_conditions(expression)?
-        .into_iter()
-        .map(|condition| parse_filter_condition(condition, columns))
-        .collect()
+) -> Result<FilterExpr, FilterParseError> {
+    FilterParser::new(expression, columns).parse()
 }
 
 pub fn parse_sort_expression(
@@ -305,64 +335,187 @@ fn parse_sort_term(term: &str, columns: &[String]) -> Result<SortSpec, SortParse
     Ok(SortSpec { column, direction })
 }
 
-fn split_filter_conditions(expression: &str) -> Result<Vec<&str>, FilterParseError> {
-    let chars = expression.char_indices().collect::<Vec<_>>();
-    let mut conditions = Vec::new();
-    let mut condition_start = 0;
-    let mut quote = None;
-    let mut index = 0;
+struct FilterParser<'a, 'columns> {
+    expression: &'a str,
+    columns: &'columns [String],
+    cursor: usize,
+}
 
-    while index < chars.len() {
-        let (byte_index, character) = chars[index];
-        if let Some(quote_character) = quote {
-            if character == quote_character {
-                if chars
-                    .get(index + 1)
-                    .is_some_and(|(_, next)| *next == quote_character)
-                {
-                    index += 2;
-                    continue;
+impl<'a, 'columns> FilterParser<'a, 'columns> {
+    fn new(expression: &'a str, columns: &'columns [String]) -> Self {
+        Self {
+            expression,
+            columns,
+            cursor: 0,
+        }
+    }
+
+    fn parse(mut self) -> Result<FilterExpr, FilterParseError> {
+        self.skip_whitespace();
+        if self.is_eof() {
+            return Err(FilterParseError::Empty);
+        }
+
+        let expression = self.parse_or()?;
+        self.skip_whitespace();
+        if self.is_eof() {
+            Ok(expression)
+        } else {
+            Err(FilterParseError::UnexpectedInput(
+                self.expression[self.cursor..].trim().to_owned(),
+            ))
+        }
+    }
+
+    fn parse_or(&mut self) -> Result<FilterExpr, FilterParseError> {
+        let mut expression = self.parse_and()?;
+        while self.consume_keyword("OR") {
+            let right = self.parse_and()?;
+            expression = FilterExpr::combine_or(expression, right);
+        }
+        Ok(expression)
+    }
+
+    fn parse_and(&mut self) -> Result<FilterExpr, FilterParseError> {
+        let mut expression = self.parse_unary()?;
+        while self.consume_keyword("AND") {
+            let right = self.parse_unary()?;
+            expression = FilterExpr::combine_and(expression, right);
+        }
+        Ok(expression)
+    }
+
+    fn parse_unary(&mut self) -> Result<FilterExpr, FilterParseError> {
+        if self.consume_keyword("NOT") {
+            return Ok(FilterExpr::Not(Box::new(self.parse_unary()?)));
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<FilterExpr, FilterParseError> {
+        self.skip_whitespace();
+        if self.consume_char('(') {
+            self.skip_whitespace();
+            if self.consume_char(')') {
+                return Err(FilterParseError::UnexpectedInput("()".to_owned()));
+            }
+            let expression = self.parse_or()?;
+            if !self.consume_char(')') {
+                return Err(FilterParseError::MissingClosingParenthesis);
+            }
+            return Ok(expression);
+        }
+
+        let start = self.cursor;
+        let end = self.condition_end()?;
+        self.cursor = end;
+        let condition = self.expression[start..end].trim();
+        if condition.is_empty() {
+            return Err(FilterParseError::UnexpectedInput(
+                self.expression[start..].trim().to_owned(),
+            ));
+        }
+        Ok(FilterExpr::Condition(parse_filter_condition(
+            condition,
+            self.columns,
+        )?))
+    }
+
+    fn condition_end(&self) -> Result<usize, FilterParseError> {
+        let mut index = self.cursor;
+        let mut quote = None;
+        while index < self.expression.len() {
+            let character = self.expression[index..]
+                .chars()
+                .next()
+                .expect("cursor must point to a character");
+            let next_index = index + character.len_utf8();
+
+            if let Some(quote_character) = quote {
+                if character == quote_character {
+                    if self.expression[next_index..]
+                        .chars()
+                        .next()
+                        .is_some_and(|next| next == quote_character)
+                    {
+                        index = next_index + quote_character.len_utf8();
+                        continue;
+                    }
+                    quote = None;
                 }
-                quote = None;
+                index = next_index;
+                continue;
             }
-            index += 1;
-            continue;
-        }
 
-        if character == '\'' || character == '"' {
-            quote = Some(character);
-            index += 1;
-            continue;
-        }
-
-        if expression[byte_index..]
-            .get(..3)
-            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("AND"))
-            && is_keyword_boundary(expression, byte_index, byte_index + 3)
-        {
-            let condition = expression[condition_start..byte_index].trim();
-            if condition.is_empty() {
-                return Err(FilterParseError::UnexpectedInput("AND".to_owned()));
+            if character == '\'' || character == '"' {
+                quote = Some(character);
+                index = next_index;
+                continue;
             }
-            conditions.push(condition);
-            condition_start = byte_index + 3;
-            index += 3;
-            continue;
+            if matches!(character, '(' | ')')
+                || self.keyword_at(index, "AND")
+                || self.keyword_at(index, "OR")
+            {
+                break;
+            }
+            index = next_index;
         }
-
-        index += 1;
+        if quote.is_some() {
+            Err(FilterParseError::UnclosedQuote)
+        } else {
+            Ok(index)
+        }
     }
 
-    if quote.is_some() {
-        return Err(FilterParseError::UnclosedQuote);
+    fn consume_keyword(&mut self, keyword: &str) -> bool {
+        let original_cursor = self.cursor;
+        self.skip_whitespace();
+        if self.keyword_at(self.cursor, keyword) {
+            self.cursor += keyword.len();
+            true
+        } else {
+            self.cursor = original_cursor;
+            false
+        }
     }
 
-    let last = expression[condition_start..].trim();
-    if last.is_empty() {
-        return Err(FilterParseError::UnexpectedInput("AND".to_owned()));
+    fn consume_char(&mut self, expected: char) -> bool {
+        let original_cursor = self.cursor;
+        self.skip_whitespace();
+        let Some(character) = self.expression[self.cursor..].chars().next() else {
+            self.cursor = original_cursor;
+            return false;
+        };
+        if character == expected {
+            self.cursor += character.len_utf8();
+            true
+        } else {
+            self.cursor = original_cursor;
+            false
+        }
     }
-    conditions.push(last);
-    Ok(conditions)
+
+    fn keyword_at(&self, start: usize, keyword: &str) -> bool {
+        self.expression[start..]
+            .get(..keyword.len())
+            .is_some_and(|candidate| {
+                candidate.eq_ignore_ascii_case(keyword)
+                    && is_keyword_boundary(self.expression, start, start + keyword.len())
+            })
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(character) = self.expression[self.cursor..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            self.cursor += character.len_utf8();
+        }
+    }
+
+    fn is_eof(&self) -> bool {
+        self.cursor >= self.expression.len()
+    }
 }
 
 fn is_keyword_boundary(expression: &str, start: usize, end: usize) -> bool {
@@ -539,7 +692,7 @@ fn parse_filter_value(value: &str) -> Option<String> {
 pub struct TableQuery {
     pub page: PageRequest,
     pub sort: Vec<SortSpec>,
-    pub filters: Vec<FilterSpec>,
+    pub filter: Option<FilterExpr>,
 }
 
 impl TableQuery {
@@ -547,8 +700,16 @@ impl TableQuery {
         Self {
             page,
             sort: Vec::new(),
-            filters: Vec::new(),
+            filter: None,
         }
+    }
+
+    pub fn add_filter(&mut self, filter: FilterSpec) {
+        let condition = FilterExpr::Condition(filter);
+        self.filter = Some(match self.filter.take() {
+            Some(existing) => FilterExpr::combine_and(existing, condition),
+            None => condition,
+        });
     }
 }
 
@@ -561,8 +722,8 @@ impl Default for TableQuery {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PAGE_SIZE, FilterOperator, FilterSpec, PageCursor, PageRequest, SortDirection,
-        SortSpec, TableQuery, parse_filter_expression, parse_sort_expression,
+        DEFAULT_PAGE_SIZE, FilterExpr, FilterOperator, FilterSpec, PageCursor, PageRequest,
+        SortDirection, SortSpec, TableQuery, parse_filter_expression, parse_sort_expression,
     };
 
     #[test]
@@ -588,7 +749,7 @@ mod tests {
 
         assert_eq!(query.page.limit, DEFAULT_PAGE_SIZE);
         assert!(query.sort.is_empty());
-        assert!(query.filters.is_empty());
+        assert!(query.filter.is_none());
     }
 
     #[test]
@@ -602,7 +763,7 @@ mod tests {
 
     #[test]
     fn parses_multiple_conditions_with_quoted_values() {
-        let filters = parse_filter_expression(
+        let filter = parse_filter_expression(
             "status = 'active' AND total >= 500 AND customer LIKE '%ACME%'",
             &[
                 "status".to_owned(),
@@ -612,32 +773,114 @@ mod tests {
         )
         .expect("valid filter expression");
 
+        let FilterExpr::And(filters) = filter else {
+            panic!("expected an AND expression");
+        };
         assert_eq!(filters.len(), 3);
-        assert_eq!(filters[0].operator, FilterOperator::Equals);
-        assert_eq!(filters[0].value.as_deref(), Some("active"));
-        assert_eq!(filters[1].operator, FilterOperator::GreaterThanOrEqual);
-        assert_eq!(filters[2].operator, FilterOperator::Like);
-        assert_eq!(filters[2].value.as_deref(), Some("%ACME%"));
+        let FilterExpr::Condition(status) = &filters[0] else {
+            panic!("expected a condition");
+        };
+        assert_eq!(status.operator, FilterOperator::Equals);
+        assert_eq!(status.value.as_deref(), Some("active"));
+        let FilterExpr::Condition(total) = &filters[1] else {
+            panic!("expected a condition");
+        };
+        assert_eq!(total.operator, FilterOperator::GreaterThanOrEqual);
+        let FilterExpr::Condition(customer) = &filters[2] else {
+            panic!("expected a condition");
+        };
+        assert_eq!(customer.operator, FilterOperator::Like);
+        assert_eq!(customer.value.as_deref(), Some("%ACME%"));
     }
 
     #[test]
     fn parses_null_and_not_like_conditions() {
-        let filters = parse_filter_expression(
+        let filter = parse_filter_expression(
             "deleted_at IS NULL AND name NOT LIKE 'test%'",
             &["deleted_at".to_owned(), "name".to_owned()],
         )
         .expect("valid filter expression");
 
-        assert_eq!(filters[0].operator, FilterOperator::IsNull);
-        assert_eq!(filters[0].value, None);
-        assert_eq!(filters[1].operator, FilterOperator::NotLike);
-        assert_eq!(filters[1].value.as_deref(), Some("test%"));
+        let FilterExpr::And(filters) = filter else {
+            panic!("expected an AND expression");
+        };
+        let FilterExpr::Condition(deleted_at) = &filters[0] else {
+            panic!("expected a condition");
+        };
+        assert_eq!(deleted_at.operator, FilterOperator::IsNull);
+        assert_eq!(deleted_at.value, None);
+        let FilterExpr::Condition(name) = &filters[1] else {
+            panic!("expected a condition");
+        };
+        assert_eq!(name.operator, FilterOperator::NotLike);
+        assert_eq!(name.value.as_deref(), Some("test%"));
+    }
+
+    #[test]
+    fn parses_boolean_precedence_and_parentheses() {
+        let filter = parse_filter_expression(
+            "status = 'active' OR (status = 'pending' AND NOT archived = 1)",
+            &["status".to_owned(), "archived".to_owned()],
+        )
+        .expect("valid boolean filter expression");
+
+        let FilterExpr::Or(branches) = filter else {
+            panic!("expected an OR expression");
+        };
+        assert_eq!(branches.len(), 2);
+        assert!(matches!(&branches[0], FilterExpr::Condition(_)));
+        let FilterExpr::And(group) = &branches[1] else {
+            panic!("expected a parenthesized AND expression");
+        };
+        assert_eq!(group.len(), 2);
+        assert!(matches!(&group[1], FilterExpr::Not(_)));
+    }
+
+    #[test]
+    fn table_query_add_filter_keeps_legacy_and_semantics() {
+        let mut query = TableQuery::default();
+        query.add_filter(FilterSpec::new("id", FilterOperator::Equals, Some("1")));
+        query.add_filter(FilterSpec::new(
+            "status",
+            FilterOperator::Equals,
+            Some("active"),
+        ));
+
+        let Some(FilterExpr::And(filters)) = query.filter else {
+            panic!("expected an AND filter");
+        };
+        assert_eq!(filters.len(), 2);
     }
 
     #[test]
     fn rejects_unknown_columns_and_unclosed_quotes() {
         assert!(parse_filter_expression("missing = 1", &["id".to_owned()]).is_err());
         assert!(parse_filter_expression("name = 'Ada", &["name".to_owned()]).is_err());
+        assert!(matches!(
+            parse_filter_expression("(name = 'Ada'", &["name".to_owned()]),
+            Err(super::FilterParseError::MissingClosingParenthesis)
+        ));
+    }
+
+    #[test]
+    fn does_not_split_boolean_keywords_inside_quoted_values() {
+        let filter = parse_filter_expression(
+            "name = 'A AND B' OR note = 'OR later'",
+            &["name".to_owned(), "note".to_owned()],
+        )
+        .expect("quoted boolean keywords are values");
+
+        let FilterExpr::Or(branches) = filter else {
+            panic!("expected an OR expression");
+        };
+        let FilterExpr::Condition(name) = &branches[0] else {
+            panic!("expected a condition");
+        };
+        assert_eq!(name.value.as_deref(), Some("A AND B"));
+        let FilterExpr::Condition(note) = &branches[1] else {
+            panic!("expected a condition");
+        };
+        assert_eq!(note.value.as_deref(), Some("OR later"));
     }
 
     #[test]

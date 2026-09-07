@@ -6,9 +6,9 @@ use std::{
 
 use crate::catalog::{CatalogCache, CatalogEntry, SearchCatalogEntry, connection_key};
 use crate::db::models::{ColumnMetadata, TableMetadata, TablePage};
-use crate::tabs::TabsState;
 use crate::services;
 use crate::table_preferences::{TablePreferences, table_preference_key};
+use crate::tabs::TabsState;
 use crate::ui;
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -21,8 +21,8 @@ use crate::{
     db::{
         models::{DbObject, ObjectKind, SqlOutput},
         query::{
-            FilterOperator, FilterSpec, PageRequest, SortDirection, SortSpec, TableQuery,
-            parse_filter_expression, parse_sort_expression,
+            FilterExpr, FilterOperator, FilterSpec, PageRequest, SortDirection, SortSpec,
+            TableQuery, parse_filter_expression, parse_sort_expression,
         },
         sybase,
     },
@@ -62,7 +62,6 @@ pub enum Focus {
     Databases,
     Kinds,
     Objects,
-    Content,
 }
 
 pub struct SearchSession {
@@ -181,18 +180,16 @@ impl Focus {
             Self::Connections => Self::Databases,
             Self::Databases => Self::Kinds,
             Self::Kinds => Self::Objects,
-            Self::Objects => Self::Content,
-            Self::Content => Self::Connections,
+            Self::Objects => Self::Connections,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Connections => Self::Content,
+            Self::Connections => Self::Objects,
             Self::Databases => Self::Connections,
             Self::Kinds => Self::Databases,
             Self::Objects => Self::Kinds,
-            Self::Content => Self::Objects,
         }
     }
 }
@@ -241,6 +238,7 @@ pub struct App {
     pub config_path: PathBuf,
     pub mode: AppMode,
     pub focus: Focus,
+    pub sidebar_visible: bool,
     pub connection_index: usize,
     pub databases: Vec<String>,
     pub database_index: usize,
@@ -296,6 +294,8 @@ pub struct App {
     pub editor_completion: Option<EditorCompletionSession>,
     column_cache: HashMap<String, Vec<ColumnMetadata>>,
     pub tabs: TabsState,
+    pending_table_filter: Option<String>,
+    pending_table_sort: Option<String>,
     active_search: Option<String>,
     catalog: CatalogCache,
     search_index: Vec<SearchCatalogEntry>,
@@ -332,6 +332,7 @@ impl App {
             config_path,
             mode: AppMode::Browser,
             focus: Focus::Connections,
+            sidebar_visible: true,
             connection_index: 0,
             databases: Vec::new(),
             database_index: 0,
@@ -382,6 +383,8 @@ impl App {
             editor_completion: None,
             column_cache: HashMap::new(),
             tabs: TabsState::load().unwrap_or_default(),
+            pending_table_filter: None,
+            pending_table_sort: None,
             last_key: String::new(),
             editor: None,
             should_quit: false,
@@ -558,6 +561,35 @@ impl App {
 
     fn handle_tab_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let in_editor_insert = self.mode == AppMode::Editor
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|s| s.editor.mode == crate::editor::VimMode::Insert);
+
+        if in_editor_insert {
+            return false;
+        }
+
+        if ctrl && key.code == KeyCode::Char('b') {
+            self.sidebar_visible = !self.sidebar_visible;
+            self.status = if self.sidebar_visible {
+                "Sidebar visible".to_owned()
+            } else {
+                "Sidebar oculto · Ctrl+b para mostrarlo".to_owned()
+            };
+            return true;
+        }
+        if shift && !ctrl && !alt && is_char_key(key, 'h') {
+            self.prev_tab();
+            return true;
+        }
+        if shift && !ctrl && !alt && is_char_key(key, 'l') {
+            self.next_tab();
+            return true;
+        }
         // Ctrl+Tab next, Ctrl+Shift+Tab (BackTab) prev
         if ctrl && key.code == KeyCode::Tab {
             self.next_tab();
@@ -572,26 +604,19 @@ impl App {
             self.close_current_tab();
             return true;
         }
-        // Ctrl+h/l for left/right, but not in editor Insert mode
-        let in_editor_insert = self.mode == AppMode::Editor
-            && self
-                .editor
-                .as_ref()
-                .is_some_and(|s| s.editor.mode == crate::editor::VimMode::Insert);
-        if !in_editor_insert {
-            if ctrl && key.code == KeyCode::Char('l') {
-                self.next_tab();
-                return true;
-            }
-            if ctrl && key.code == KeyCode::Char('h') {
-                self.prev_tab();
-                return true;
-            }
-            // Backspace with ctrl is often Ctrl+h
-            if ctrl && key.code == KeyCode::Backspace {
-                self.prev_tab();
-                return true;
-            }
+        // Ctrl+h/l for left/right outside editor Insert mode.
+        if ctrl && key.code == KeyCode::Char('l') {
+            self.next_tab();
+            return true;
+        }
+        if ctrl && key.code == KeyCode::Char('h') {
+            self.prev_tab();
+            return true;
+        }
+        // Backspace with ctrl is often Ctrl+h.
+        if ctrl && key.code == KeyCode::Backspace {
+            self.prev_tab();
+            return true;
         }
         false
     }
@@ -601,6 +626,7 @@ impl App {
             self.status = "No hay tabs".to_owned();
             return;
         }
+        self.persist_active_editor();
         self.tabs.next();
         let _ = self.tabs.save();
         self.load_active_tab();
@@ -611,6 +637,7 @@ impl App {
             self.status = "No hay tabs".to_owned();
             return;
         }
+        self.persist_active_editor();
         self.tabs.prev();
         let _ = self.tabs.save();
         self.load_active_tab();
@@ -621,11 +648,8 @@ impl App {
             self.status = "No hay tabs para cerrar".to_owned();
             return;
         }
-        let title = self
-            .tabs
-            .active()
-            .map(|t| t.title())
-            .unwrap_or_default();
+        let title = self.tabs.active().map(|t| t.title()).unwrap_or_default();
+        self.persist_active_editor();
         self.tabs.close_active();
         let _ = self.tabs.save();
         if self.tabs.is_empty() {
@@ -648,25 +672,54 @@ impl App {
             self.set_error("Selecciona una base de datos".to_owned());
             return;
         };
+        self.open_tab_for_object(database, object);
+    }
+
+    fn open_tab_for_object(&mut self, database: String, object: DbObject) {
+        self.persist_active_editor();
         self.tabs.push(database.clone(), &object);
         let _ = self.tabs.save();
         self.load_tab_by_object(database, object);
+    }
+
+    fn persist_active_editor(&mut self) {
+        let editor_text = self.editor.as_ref().map(|editor| editor.editor.text());
+        let filter = self.table_filter_expression.clone();
+        let sort = format_sort_expression(&self.table_query.sort);
+        if let Some(tab) = self.tabs.tabs.get_mut(self.tabs.active) {
+            if tab.kind == crate::tabs::TabKind::Table {
+                tab.table_filter = filter;
+                tab.table_sort = sort;
+            } else if let Some(editor_text) = editor_text {
+                tab.editor_text = Some(editor_text);
+            }
+            let _ = self.tabs.save();
+        }
     }
 
     fn load_active_tab(&mut self) {
         let Some(tab) = self.tabs.active().cloned() else {
             return;
         };
-        self.load_tab_by_object(tab.database.clone(), tab.to_object());
+        if tab.kind == crate::tabs::TabKind::Query {
+            self.open_query_tab_editor(tab.database, tab.editor_text.unwrap_or_default());
+        } else if let Some(object) = tab.to_object() {
+            self.load_tab_by_object(tab.database, object);
+        }
     }
 
     fn load_tab_by_object(&mut self, database: String, object: DbObject) {
+        self.editor = None;
+        if let Some(index) = self.databases.iter().position(|name| name == &database) {
+            self.database_index = index;
+        }
         if object.kind == ObjectKind::Table {
             let Some(profile) = self.current_profile().cloned() else {
                 return;
             };
             let connection_index = self.connection_index;
-            let request_id = self.begin_request(format!("Consultando {}...", object.qualified_name()));
+            let request_id =
+                self.begin_request(format!("Consultando {}...", object.qualified_name()));
             self.clear_table_cell_editing();
             self.table_metadata = None;
             self.table_page = None;
@@ -676,7 +729,17 @@ impl App {
             self.sort_session = None;
             self.column_search_session = None;
             self.table_loading_more = false;
+            if let Some(tab) = self.tabs.active() {
+                self.pending_table_filter =
+                    (!tab.table_filter.is_empty()).then(|| tab.table_filter.clone());
+                self.pending_table_sort =
+                    (!tab.table_sort.is_empty()).then(|| tab.table_sort.clone());
+            } else {
+                self.pending_table_filter = None;
+                self.pending_table_sort = None;
+            }
             self.current_content_object = Some(object.clone());
+            self.mode = AppMode::Browser;
             self.send(WorkerRequest::LoadTableMetadata {
                 request_id,
                 connection_index,
@@ -690,6 +753,9 @@ impl App {
             };
             let connection_index = self.connection_index;
             let request_id = self.begin_request(format!("Leyendo {}...", object.qualified_name()));
+            self.current_content_object = Some(object.clone());
+            self.open_editor_after_definition = Some((request_id, object.clone()));
+            self.mode = AppMode::Browser;
             self.send(WorkerRequest::LoadDefinition {
                 request_id,
                 connection_index,
@@ -731,7 +797,6 @@ impl App {
             KeyCode::Char('2') => self.focus = Focus::Databases,
             KeyCode::Char('3') => self.focus = Focus::Kinds,
             KeyCode::Char('4') => self.focus = Focus::Objects,
-            KeyCode::Char('5') => self.focus = Focus::Content,
             KeyCode::Char('y') => {
                 if self.content.is_empty() {
                     self.status = "No hay contenido para copiar".to_owned();
@@ -794,50 +859,6 @@ impl App {
             self.show_editor_hover();
             return;
         }
-        if matches!(key.code, KeyCode::PageUp) {
-            self.content_scroll = self.content_scroll.saturating_sub(8);
-            self.status = format!("Consola · scroll {}", self.content_scroll);
-            return;
-        }
-        if matches!(key.code, KeyCode::PageDown) {
-            self.content_scroll = self.content_scroll.saturating_add(8);
-            self.status = format!("Consola · scroll {}", self.content_scroll);
-            return;
-        }
-        if matches!(key.code, KeyCode::Home) {
-            self.content_scroll = 0;
-            self.status = "Consola · arriba".to_owned();
-            return;
-        }
-        if matches!(key.code, KeyCode::End) {
-            self.content_scroll = u16::MAX;
-            self.status = "Consola · abajo".to_owned();
-            return;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
-            if self.content.is_empty() {
-                self.status = "Consola vacía".to_owned();
-            } else {
-                match crate::services::clipboard::copy_text(&self.content) {
-                    Ok(()) => {
-                        self.status = format!("Consola copiada · {} líneas", self.content.lines().count());
-                    }
-                    Err(e) => self.status = format!("ERROR al copiar consola: {e}"),
-                }
-            }
-            return;
-        }
-        if key.code == KeyCode::Char('L') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.content.clear();
-            self.content_title = "Consola".to_owned();
-            self.content_scroll = 0;
-            self.highlighted_content = None;
-            self.console_elapsed_ms = None;
-            self.console_success = None;
-            self.status = "Consola limpiada".to_owned();
-            return;
-        }
-
         let command = match self.editor.as_mut() {
             Some(session) => session.editor.handle_key(key),
             None => {
@@ -849,6 +870,33 @@ impl App {
         match command {
             EditorCommand::None => {}
             EditorCommand::Save => self.save_editor(),
+            EditorCommand::ExecuteSelection => self.execute_selected_editor(),
+            EditorCommand::CopyToClipboard(text) => {
+                let line_count = text.lines().count();
+                match services::clipboard::copy_text(&text) {
+                    Ok(()) => {
+                        self.status =
+                            format!("Selección copiada al portapapeles · {line_count} líneas");
+                    }
+                    Err(error) => {
+                        self.status = format!("ERROR al copiar selección: {error}");
+                    }
+                }
+            }
+            EditorCommand::PasteFromClipboard => match services::clipboard::read_text() {
+                Ok(text) => {
+                    if let Some(session) = self.editor.as_mut() {
+                        session.editor.paste_external_text(&text);
+                        self.status = format!(
+                            "Pegado desde portapapeles · {} líneas",
+                            text.lines().count()
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("ERROR al leer portapapeles: {error}");
+                }
+            },
             EditorCommand::Close => {
                 let dirty = self
                     .editor
@@ -866,6 +914,23 @@ impl App {
                 }
             }
         }
+    }
+
+    fn execute_selected_editor(&mut self) {
+        let Some(sql) = self
+            .editor
+            .as_ref()
+            .and_then(|session| session.editor.selected_text())
+        else {
+            self.status = "No hay selección visual · usa v y mueve el cursor".to_owned();
+            return;
+        };
+        if sql.trim().is_empty() {
+            self.status = "La selección está vacía".to_owned();
+            return;
+        }
+        self.return_to_editor_after_execution = true;
+        self.dispatch_execute(sql);
     }
 
     fn handle_editor_completion_key(&mut self, key: KeyEvent) -> bool {
@@ -942,12 +1007,18 @@ impl App {
         session
             .editor
             .textarea
-            .move_cursor(ratatui_textarea::CursorMove::Jump(row as u16, start_col as u16));
+            .move_cursor(ratatui_textarea::CursorMove::Jump(
+                row as u16,
+                start_col as u16,
+            ));
         if prefix_len > 0 {
             session.editor.textarea.delete_str(prefix_len);
         }
         session.editor.textarea.insert_str(&item.insert_text);
-        session.editor.textarea.move_cursor(ratatui_textarea::CursorMove::Forward);
+        session
+            .editor
+            .textarea
+            .move_cursor(ratatui_textarea::CursorMove::Forward);
         // mark dirty via private field access through handle? set dirty directly
         // VimEditor dirty is private, but we can set via method? There's no setter, but we can reach via session.editor.dirty is private. Use workaround: call insert of empty? Simpler: set via direct field if we make it pub or use a method.
         // For now, we will just rely on textarea modification not automatically setting dirty; we need to set dirty manually via a hack: make dirty pub or add method.
@@ -965,21 +1036,17 @@ impl App {
         let line = lines.get(cursor.0).cloned().unwrap_or_default();
         let chars: Vec<char> = line.chars().collect();
         let mut start = cursor.1.min(chars.len());
-        while start > 0
-            && {
-                let c = chars[start - 1];
-                c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '@'
-            }
-        {
+        while start > 0 && {
+            let c = chars[start - 1];
+            c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '@'
+        } {
             start -= 1;
         }
         let mut end = cursor.1.min(chars.len());
-        while end < chars.len()
-            && {
-                let c = chars[end];
-                c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '@'
-            }
-        {
+        while end < chars.len() && {
+            let c = chars[end];
+            c.is_alphanumeric() || c == '_' || c == '#' || c == '$' || c == '@'
+        } {
             end += 1;
         }
         if start == end {
@@ -988,10 +1055,7 @@ impl App {
         }
         let word: String = chars[start..end].iter().collect();
         let word_lower = word.to_ascii_lowercase();
-        let current_db = self
-            .active_database()
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let current_db = self.active_database().unwrap_or("").to_ascii_lowercase();
         for entry in &self.search_index {
             if entry.entry.database.to_ascii_lowercase() != current_db && !current_db.is_empty() {
                 continue;
@@ -1006,7 +1070,11 @@ impl App {
                 let owner = entry.entry.owner.as_deref().unwrap_or("dbo");
                 let mut msg = format!(
                     "{}: {}.{} · {} [{}]",
-                    kind, owner, entry.entry.name, entry.entry.database, entry.entry.connection_name
+                    kind,
+                    owner,
+                    entry.entry.name,
+                    entry.entry.database,
+                    entry.entry.connection_name
                 );
                 if let Some(meta) = self.table_metadata.as_ref() {
                     if meta.identifier.name.eq_ignore_ascii_case(&word) {
@@ -1054,17 +1122,15 @@ impl App {
     ) -> Vec<CompletionItem> {
         let lower_prefix = prefix.to_ascii_lowercase();
         let mut items: Vec<CompletionItem> = Vec::new();
-        let current_db = self
-            .active_database()
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let current_db = self.active_database().unwrap_or("").to_ascii_lowercase();
         if let Some(qual) = qualifier {
             let qual_lower = qual.to_ascii_lowercase();
             if let Some(meta) = self.table_metadata.as_ref() {
                 let table_name = meta.identifier.name.to_ascii_lowercase();
                 let schema = meta.identifier.schema.to_ascii_lowercase();
                 let full = format!("{}.{}", schema, table_name);
-                let qual_is_table = qual_lower == table_name || qual_lower == full || qual_lower == schema;
+                let qual_is_table =
+                    qual_lower == table_name || qual_lower == full || qual_lower == schema;
                 if qual_is_table {
                     for col in &meta.columns {
                         let col_lower = col.name.to_ascii_lowercase();
@@ -1091,7 +1157,11 @@ impl App {
                         });
                     }
                     if !items.is_empty() {
-                        items.sort_by(|a, b| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()));
+                        items.sort_by(|a, b| {
+                            a.label
+                                .to_ascii_lowercase()
+                                .cmp(&b.label.to_ascii_lowercase())
+                        });
                         items.truncate(30);
                         return items;
                     }
@@ -1106,7 +1176,8 @@ impl App {
                 if !current_db.is_empty() && db != current_db {
                     continue;
                 }
-                let table_match = qual_lower == table || qual_lower == format!("{}.{}", parts[1], table);
+                let table_match =
+                    qual_lower == table || qual_lower == format!("{}.{}", parts[1], table);
                 if !table_match {
                     continue;
                 }
@@ -1131,7 +1202,11 @@ impl App {
             if !items.is_empty() {
                 let mut seen = std::collections::HashSet::new();
                 items.retain(|it| seen.insert(it.label.to_ascii_lowercase()));
-                items.sort_by(|a, b| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()));
+                items.sort_by(|a, b| {
+                    a.label
+                        .to_ascii_lowercase()
+                        .cmp(&b.label.to_ascii_lowercase())
+                });
                 items.truncate(30);
             }
             return items;
@@ -2476,7 +2551,9 @@ impl App {
         });
         self.mode = AppMode::Table;
         self.refresh_table_filter_suggestions();
-        self.status = "Escribe el filtro · Tab completa · Enter aplica · Esc cancela".to_owned();
+        self.status =
+            "Escribe el filtro (AND/OR/NOT y paréntesis) · Tab completa · Enter aplica · Esc cancela"
+                .to_owned();
     }
 
     fn handle_table_filter_key(&mut self, key: KeyEvent) {
@@ -2559,7 +2636,7 @@ impl App {
         let columns = self.table_columns();
         let suggestions = table_filter_suggestions(&expression, &columns);
         let preview = parse_filter_expression(&expression, &columns)
-            .map(|filters| filters.iter().map(format_filter_spec).collect::<Vec<_>>())
+            .map(|filter| vec![format_filter_expression(&filter)])
             .unwrap_or_default();
         let parse_error = if expression.trim().is_empty() {
             None
@@ -2599,7 +2676,8 @@ impl App {
         };
 
         self.table_filter_expression = expression;
-        self.table_query.filters = filters;
+        self.table_query.filter = Some(filters);
+        self.persist_active_editor();
         self.table_query.page.cursor = None;
         self.filter_session = None;
         self.reset_table_page();
@@ -2607,12 +2685,13 @@ impl App {
     }
 
     fn clear_table_filter(&mut self) {
-        if self.table_query.filters.is_empty() && self.table_filter_expression.is_empty() {
+        if self.table_query.filter.is_none() && self.table_filter_expression.is_empty() {
             self.status = "No hay filtros activos".to_owned();
             return;
         }
-        self.table_query.filters.clear();
+        self.table_query.filter = None;
         self.table_filter_expression.clear();
+        self.persist_active_editor();
         self.table_query.page.cursor = None;
         self.filter_session = None;
         self.reset_table_page();
@@ -2753,6 +2832,7 @@ impl App {
         };
 
         self.table_query.sort = sort;
+        self.persist_active_editor();
         self.sort_session = None;
         self.reset_table_page();
         self.load_table_query_page("Aplicando ordenamiento...");
@@ -2764,6 +2844,7 @@ impl App {
             return;
         }
         self.table_query.sort.clear();
+        self.persist_active_editor();
         self.sort_session = None;
         self.reset_table_page();
         self.load_table_query_page("Limpiando ordenamiento...");
@@ -3435,11 +3516,11 @@ impl App {
     }
 
     fn open_selected_object(&mut self, object: DbObject) {
-        if object.kind == ObjectKind::Table {
-            self.preview_selected_table();
-        } else {
-            self.load_definition(false);
-        }
+        let Some(database) = self.current_database().map(ToOwned::to_owned) else {
+            self.set_error("Selecciona una base de datos".to_owned());
+            return;
+        };
+        self.open_tab_for_object(database, object);
     }
 
     fn maybe_refresh_catalog(&mut self, force: bool) {
@@ -3561,15 +3642,6 @@ impl App {
             Focus::Objects => {
                 self.object_index = shifted_index(self.object_index, self.objects.len(), delta);
             }
-            Focus::Content => {
-                if delta < 0 {
-                    self.content_scroll = self
-                        .content_scroll
-                        .saturating_sub(delta.unsigned_abs() as u16);
-                } else {
-                    self.content_scroll = self.content_scroll.saturating_add(delta as u16);
-                }
-            }
         }
     }
 
@@ -3580,9 +3652,6 @@ impl App {
             Focus::Databases => self.database_index = edge(self.databases.len()),
             Focus::Kinds => self.kind_index = edge(ObjectKind::ALL.len()),
             Focus::Objects => self.object_index = edge(self.objects.len()),
-            Focus::Content => {
-                self.content_scroll = if end { u16::MAX } else { 0 };
-            }
         }
     }
 
@@ -3600,7 +3669,6 @@ impl App {
             Focus::Objects => {
                 self.open_tab_for_current_object();
             }
-            Focus::Content => {}
         }
     }
 
@@ -3611,13 +3679,7 @@ impl App {
                 self.load_databases();
             }
             Focus::Databases | Focus::Kinds => self.load_objects(),
-            Focus::Objects | Focus::Content => {
-                if self.current_object().is_some() {
-                    self.load_definition(false);
-                } else {
-                    self.load_objects();
-                }
-            }
+            Focus::Objects => self.load_active_tab(),
         }
     }
 
@@ -3715,53 +3777,13 @@ impl App {
         });
     }
 
-    fn preview_selected_table(&mut self) {
-        let Some(object) = self.current_object().cloned() else {
-            self.set_error("Selecciona una tabla".to_owned());
-            return;
-        };
-        if object.kind != ObjectKind::Table {
-            self.set_error("La vista previa con 'p' solo aplica a tablas".to_owned());
-            return;
-        }
+    fn load_first_table_page(&mut self, database: String, object: DbObject) {
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
         let connection_index = self.connection_index;
-        let Some(database) = self.current_database().map(ToOwned::to_owned) else {
-            return;
-        };
         let request_id = self.begin_request(format!("Consultando {}...", object.qualified_name()));
         self.clear_table_cell_editing();
-        self.table_metadata = None;
-        self.table_page = None;
-        self.table_query = TableQuery::new(PageRequest::default());
-        self.table_filter_expression.clear();
-        self.filter_session = None;
-        self.sort_session = None;
-        self.column_search_session = None;
-        self.table_loading_more = false;
-        self.current_content_object = Some(object.clone());
-        self.send(WorkerRequest::LoadTableMetadata {
-            request_id,
-            connection_index,
-            database,
-            object,
-            profile,
-        });
-    }
-
-    fn load_first_table_page(&mut self, object: DbObject) {
-        let Some(profile) = self.current_profile().cloned() else {
-            return;
-        };
-        let connection_index = self.connection_index;
-        let Some(database) = self.current_database().map(ToOwned::to_owned) else {
-            return;
-        };
-        let request_id = self.begin_request(format!("Consultando {}...", object.qualified_name()));
-        self.clear_table_cell_editing();
-        self.table_query = TableQuery::default();
         self.sort_session = None;
         self.column_search_session = None;
         self.send(WorkerRequest::QueryTable {
@@ -3782,7 +3804,7 @@ impl App {
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
-        let Some(database) = self.current_database().map(ToOwned::to_owned) else {
+        let Some(database) = self.active_tab_database() else {
             return;
         };
         let request_id = self.begin_request(status);
@@ -3826,7 +3848,7 @@ impl App {
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
-        let Some(database) = self.current_database().map(ToOwned::to_owned) else {
+        let Some(database) = self.active_tab_database() else {
             return;
         };
         self.table_query.page.cursor = Some(cursor);
@@ -3896,14 +3918,21 @@ impl App {
     }
 
     fn open_query_editor(&mut self) {
-        let database = self.active_database().unwrap_or("master");
+        self.persist_active_editor();
+        let database = self.active_database().unwrap_or("master").to_owned();
         let template = format!(
             "-- T-SQL en {database}\n-- Ctrl+S ejecuta; las escrituras requieren confirmación.\n\nselect db_name() as base_actual\n"
         );
+        self.tabs.push_query(database.clone(), template.clone());
+        let _ = self.tabs.save();
+        self.open_query_tab_editor(database, template);
+    }
+
+    fn open_query_tab_editor(&mut self, database: String, text: String) {
         self.editor = Some(EditorSession {
             title: format!("Consulta T-SQL · {database}"),
             purpose: EditorPurpose::Query,
-            editor: VimEditor::new(template),
+            editor: VimEditor::new(text),
         });
         self.content_title = "Resultado de ejecución".to_owned();
         self.content.clear();
@@ -3979,8 +4008,8 @@ impl App {
         };
         let connection_index = self.connection_index;
         let database = self
-            .active_database()
-            .map(ToOwned::to_owned)
+            .active_tab_database()
+            .or_else(|| self.active_database().map(ToOwned::to_owned))
             .unwrap_or_else(|| profile.initial_database().to_owned());
         let request_id = self.begin_request(format!("Ejecutando T-SQL en {database}..."));
         self.send(WorkerRequest::ExecuteSql {
@@ -4073,11 +4102,17 @@ impl App {
                 } else {
                     self.mode = AppMode::Table;
                     self.status = if table_execution_rolled_back(&output) {
-                        format!("Transacción revertida{elapsed_suffix} · los cambios staged se conservaron")
+                        format!(
+                            "Transacción revertida{elapsed_suffix} · los cambios staged se conservaron"
+                        )
                     } else if output.success {
-                        format!("No se confirmó el commit{elapsed_suffix} · los cambios staged se conservaron")
+                        format!(
+                            "No se confirmó el commit{elapsed_suffix} · los cambios staged se conservaron"
+                        )
                     } else {
-                        format!("ASE/isql devolvió un error{elapsed_suffix} · los cambios staged se conservaron")
+                        format!(
+                            "ASE/isql devolvió un error{elapsed_suffix} · los cambios staged se conservaron"
+                        )
                     };
                 }
             }
@@ -4105,6 +4140,19 @@ impl App {
             "ERROR: {} · los cambios staged se conservaron{elapsed_suffix} · Enter/Esc cierra",
             first_line(self.execution_error_modal.as_deref().unwrap_or_default())
         );
+    }
+
+    fn active_tab_matches(&self, database: &str, object: &DbObject) -> bool {
+        self.tabs.active().is_some_and(|tab| {
+            tab.database == database
+                && tab
+                    .to_object()
+                    .is_some_and(|candidate| candidate.eq(object))
+        })
+    }
+
+    fn active_tab_database(&self) -> Option<String> {
+        self.tabs.active().map(|tab| tab.database.clone())
     }
 
     fn handle_worker_response(&mut self, response: WorkerResponse) {
@@ -4211,14 +4259,13 @@ impl App {
                 object,
                 result,
             } => {
+                let active_tab_matches = self.active_tab_matches(&database, &object);
                 let requested_editor = self.open_editor_after_definition.as_ref().is_some_and(
                     |(pending_id, pending_object)| {
-                        *pending_id == request_id && pending_object == &object
+                        *pending_id == request_id && pending_object == &object && active_tab_matches
                     },
                 );
-                if self.connection_index != connection_index
-                    || self.current_database() != Some(database.as_str())
-                {
+                if self.connection_index != connection_index || !active_tab_matches {
                     if requested_editor {
                         self.open_editor_after_definition = None;
                     }
@@ -4226,6 +4273,18 @@ impl App {
                 }
                 match result {
                     Ok(definition) => {
+                        let editor_text = if requested_editor {
+                            self.tabs.active().and_then(|tab| {
+                                (tab.database == database
+                                    && tab
+                                        .to_object()
+                                        .is_some_and(|candidate| candidate.eq(&object)))
+                                .then(|| tab.editor_text.clone())
+                                .flatten()
+                            })
+                        } else {
+                            None
+                        };
                         self.content_title =
                             format!("{} · {}", object.kind, object.qualified_name());
                         self.content_scroll = 0;
@@ -4243,7 +4302,7 @@ impl App {
                         self.status = format!("Definición cargada: {}", object.qualified_name());
                         if requested_editor {
                             self.open_editor_after_definition = None;
-                            self.open_object_editor(object, definition);
+                            self.open_object_editor(object, editor_text.unwrap_or(definition));
                         }
                     }
                     Err(error) => {
@@ -4262,8 +4321,7 @@ impl App {
                 ..
             } => {
                 if self.connection_index != connection_index
-                    || self.current_database() != Some(database.as_str())
-                    || self.current_content_object.as_ref() != Some(&object)
+                    || !self.active_tab_matches(&database, &object)
                 {
                     return;
                 }
@@ -4327,12 +4385,28 @@ impl App {
                             metadata.identifier.schema.to_ascii_lowercase(),
                             metadata.identifier.name.to_ascii_lowercase()
                         );
-                        self.column_cache.insert(cache_key, metadata.columns.clone());
+                        self.column_cache
+                            .insert(cache_key, metadata.columns.clone());
                         self.table_metadata = Some(metadata);
+                        let columns = self.table_columns();
+                        let filter_expression = self.pending_table_filter.take();
+                        let sort_expression = self.pending_table_sort.take();
+                        self.table_query.filter = filter_expression
+                            .as_deref()
+                            .filter(|expression| !expression.trim().is_empty())
+                            .and_then(|expression| {
+                                parse_filter_expression(expression, &columns).ok()
+                            });
+                        self.table_filter_expression = filter_expression.unwrap_or_default();
+                        self.table_query.sort = sort_expression
+                            .as_deref()
+                            .filter(|expression| !expression.trim().is_empty())
+                            .and_then(|expression| parse_sort_expression(expression, &columns).ok())
+                            .unwrap_or_default();
                         self.status = format!(
                             "Metadata cargada · {column_count} columnas · {index_count} índices"
                         );
-                        self.load_first_table_page(object);
+                        self.load_first_table_page(database, object);
                     }
                     Err(error) => self.set_error(error),
                 }
@@ -4346,7 +4420,7 @@ impl App {
                 ..
             } => {
                 if self.connection_index != connection_index
-                    || self.current_database() != Some(database.as_str())
+                    || !self.active_tab_matches(&database, &object)
                 {
                     return;
                 }
@@ -4418,14 +4492,18 @@ impl App {
                 elapsed_ms,
                 ..
             } => {
+                let expected_database = self
+                    .active_tab_database()
+                    .or_else(|| self.active_database().map(ToOwned::to_owned));
                 if self.connection_index != connection_index
-                    || self.active_database() != Some(database.as_str())
+                    || expected_database.as_deref() != Some(database.as_str())
                 {
                     return;
                 }
                 self.console_elapsed_ms = Some(elapsed_ms);
                 if self.return_to_table_after_execution {
-                    self.console_success = Some(result.as_ref().map(|o| o.success).unwrap_or(false));
+                    self.console_success =
+                        Some(result.as_ref().map(|o| o.success).unwrap_or(false));
                     self.handle_table_changes_execution_result(database, result);
                     self.return_to_table_after_execution = false;
                     self.busy_count = self.pending_requests.len();
@@ -4448,14 +4526,16 @@ impl App {
                         self.column_search_session = None;
                         self.table_show_metadata = false;
                         let status_icon = if output.success { "✓" } else { "✗" };
-                        self.content_title =
-                            format!("Consola · {database} · {elapsed}ms · {line_count} líneas {status_icon}");
+                        self.content_title = format!(
+                            "Consola · {database} · {elapsed}ms · {line_count} líneas {status_icon}"
+                        );
                         if output.success {
                             if let Some(session) = self.editor.as_mut() {
                                 session.editor.mark_clean();
                             }
-                            self.status =
-                                format!("T-SQL OK · {elapsed}ms · {line_count} líneas · {status_icon}");
+                            self.status = format!(
+                                "T-SQL OK · {elapsed}ms · {line_count} líneas · {status_icon}"
+                            );
                         } else {
                             self.status = format!("ASE/isql ERROR · {elapsed}ms {status_icon}");
                         }
@@ -4473,8 +4553,9 @@ impl App {
                         self.sort_session = None;
                         self.column_search_session = None;
                         self.table_show_metadata = false;
-                        self.content_title =
-                            format!("Consola · {database} · {elapsed_ms}ms · {line_count} líneas ✗");
+                        self.content_title = format!(
+                            "Consola · {database} · {elapsed_ms}ms · {line_count} líneas ✗"
+                        );
                         self.status = format!("ERROR · {elapsed_ms}ms · {}", first_line(&error));
                     }
                 }
@@ -4666,6 +4747,8 @@ fn table_filter_suggestions(expression: &str, columns: &[String]) -> Vec<FilterS
     let normalized_prefix = prefix.trim_end().to_ascii_uppercase();
     let expecting_column = prefix.trim().is_empty()
         || normalized_prefix.ends_with("AND")
+        || normalized_prefix.ends_with("OR")
+        || normalized_prefix.ends_with("NOT")
         || normalized_prefix.ends_with('(');
     let mut suggestions = Vec::new();
 
@@ -4716,11 +4799,15 @@ fn table_filter_suggestions(expression: &str, columns: &[String]) -> Vec<FilterS
                 }),
         );
     } else if normalized_prefix.ends_with("IS NULL") || normalized_prefix.ends_with("IS NOT NULL") {
-        suggestions.push(FilterSuggestion {
-            label: "AND".to_owned(),
-            insertion: "AND ".to_owned(),
-            replace_start: token_start,
-        });
+        suggestions.extend(
+            [("AND", "AND "), ("OR", "OR ")]
+                .iter()
+                .map(|(label, insertion)| FilterSuggestion {
+                    label: (*label).to_owned(),
+                    insertion: (*insertion).to_owned(),
+                    replace_start: token_start,
+                }),
+        );
     } else if normalized_prefix.ends_with("IS NOT") {
         suggestions.extend(
             [("NULL", "NULL ")]
@@ -4773,7 +4860,7 @@ fn table_filter_suggestions(expression: &str, columns: &[String]) -> Vec<FilterS
         });
     } else {
         suggestions.extend(
-            ["AND"]
+            ["AND", "OR"]
                 .iter()
                 .filter(|keyword| {
                     keyword
@@ -4782,7 +4869,7 @@ fn table_filter_suggestions(expression: &str, columns: &[String]) -> Vec<FilterS
                 })
                 .map(|keyword| FilterSuggestion {
                     label: (*keyword).to_owned(),
-                    insertion: "AND ".to_owned(),
+                    insertion: format!("{keyword} "),
                     replace_start: token_start,
                 }),
         );
@@ -4857,6 +4944,26 @@ fn format_sort_expression(sort: &[SortSpec]) -> String {
         .map(format_sort_spec)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn format_filter_expression(filter: &FilterExpr) -> String {
+    match filter {
+        FilterExpr::Condition(filter) => format_filter_spec(filter),
+        FilterExpr::And(filters) => filters
+            .iter()
+            .map(format_filter_expression)
+            .collect::<Vec<_>>()
+            .join(" AND "),
+        FilterExpr::Or(filters) => format!(
+            "({})",
+            filters
+                .iter()
+                .map(format_filter_expression)
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        ),
+        FilterExpr::Not(filter) => format!("NOT ({})", format_filter_expression(filter)),
+    }
 }
 
 fn format_filter_spec(filter: &FilterSpec) -> String {
@@ -5030,6 +5137,13 @@ fn format_key(key: KeyEvent) -> String {
     };
     parts.push(code);
     parts.join("+")
+}
+
+fn is_char_key(key: KeyEvent, lowercase: char) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char(character) if character == lowercase || character == lowercase.to_ascii_uppercase()
+    )
 }
 
 fn format_table_type(column: &ColumnMetadata) -> String {
@@ -5685,18 +5799,22 @@ fn shift_row_indexes(rows: &BTreeSet<usize>, removed_row: usize) -> BTreeSet<usi
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppMode, TableCellDraft, TableCopySource, TableDateTimeKind, TableDraftChange,
-        compact_table_summary_value, contains_executable_table_sql, format_parsed_table_date_time,
-        format_table_type, is_write_sql, normalize_definition_for_edit,
-        parse_table_date_time_value, reorder_table_page, selected_table_value, shift_row_indexes,
-        shifted_index, store_table_cell_draft, table_copy_rows_text, table_copy_text,
-        table_date_time_kind, table_draft_exit_message, table_execution_committed,
-        table_execution_rolled_back, table_exit_message, table_filter_suggestions,
-        table_sort_suggestions, validate_table_cell_value,
+        App, AppMode, EditorPurpose, EditorSession, TableCellDraft, TableCopySource,
+        TableDateTimeKind, TableDraftChange, compact_table_summary_value,
+        contains_executable_table_sql, format_parsed_table_date_time, format_table_type,
+        is_write_sql, normalize_definition_for_edit, parse_table_date_time_value,
+        reorder_table_page, selected_table_value, shift_row_indexes, shifted_index,
+        store_table_cell_draft, table_copy_rows_text, table_copy_text, table_date_time_kind,
+        table_draft_exit_message, table_execution_committed, table_execution_rolled_back,
+        table_exit_message, table_filter_suggestions, table_sort_suggestions,
+        validate_table_cell_value,
     };
     use crate::config::{AppConfig, ConnectionProfile};
     use crate::db::models::{ColumnMetadata, SqlOutput, TablePage};
     use crate::db::query::PageCursor;
+    use crate::editor::VimEditor;
+    use crate::tabs::TabsState;
+    use crate::worker::WorkerResponse;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -5818,6 +5936,34 @@ mod tests {
             next_columns
                 .iter()
                 .any(|suggestion| suggestion.label == "total")
+        );
+
+        let or_columns = table_filter_suggestions("status = 'active' OR ", &columns);
+        assert!(
+            or_columns
+                .iter()
+                .any(|suggestion| suggestion.label == "total")
+        );
+
+        let not_columns = table_filter_suggestions("NOT ", &columns);
+        assert!(
+            not_columns
+                .iter()
+                .any(|suggestion| suggestion.label == "status")
+        );
+
+        let boolean_operators = table_filter_suggestions("status = 'active' ", &columns);
+        assert!(
+            boolean_operators
+                .iter()
+                .any(|suggestion| suggestion.label == "OR")
+        );
+        assert_eq!(
+            boolean_operators
+                .iter()
+                .find(|suggestion| suggestion.label == "OR")
+                .map(|suggestion| suggestion.insertion.as_str()),
+            Some("OR ")
         );
     }
 
@@ -6095,6 +6241,62 @@ mod tests {
 
         assert!(app.current_execution_error_modal().is_none());
         assert_eq!(app.table_cell_drafts.len(), 1);
+    }
+
+    #[test]
+    fn accepts_sql_results_for_the_active_tab_database() {
+        let config = AppConfig {
+            connections: vec![ConnectionProfile {
+                name: "test".to_owned(),
+                backend: "sybase_isql".to_owned(),
+                isql_path: "isql".to_owned(),
+                userstore_key: Some("test".to_owned()),
+                server: None,
+                username: None,
+                password_env: None,
+                database: Some("master".to_owned()),
+                charset: None,
+                allow_writes: true,
+                extra_args: Vec::new(),
+            }],
+            catalog_ttl_hours: 24,
+        };
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (_response_tx, response_rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            config,
+            PathBuf::from("connections.toml"),
+            request_tx,
+            response_rx,
+        );
+        app.tabs = TabsState::default();
+        app.tabs
+            .push_query("reporting".to_owned(), "select 1".to_owned());
+        app.databases = vec!["master".to_owned(), "reporting".to_owned()];
+        app.database_index = 0;
+        app.editor = Some(EditorSession {
+            title: "Consulta".to_owned(),
+            purpose: EditorPurpose::Query,
+            editor: VimEditor::new("select 1"),
+        });
+        app.mode = AppMode::Editor;
+        app.return_to_editor_after_execution = true;
+
+        app.handle_worker_response(WorkerResponse::SqlExecuted {
+            request_id: 1,
+            connection_index: 0,
+            database: "reporting".to_owned(),
+            result: Ok(SqlOutput {
+                stdout: "ok".to_owned(),
+                stderr: String::new(),
+                success: true,
+                elapsed_ms: 1,
+            }),
+            elapsed_ms: 1,
+        });
+
+        assert_eq!(app.content, "ok");
+        assert_eq!(app.mode, AppMode::Editor);
     }
 
     #[test]

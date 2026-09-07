@@ -121,6 +121,7 @@ cargo build --release
 | Tecla | Acción |
 |---|---|
 | `h` / `l`, `Tab` / `Shift+Tab` | Cambiar panel |
+| `Shift+H` / `Shift+L`, `Ctrl+Tab` / `Ctrl+Shift+Tab` | Cambiar tab |
 | `j` / `k` | Mover selección o scroll del contenido |
 | `g` / `G` | Inicio / final |
 | `Enter` | Activar conexión, cargar objetos o abrir definición |
@@ -142,14 +143,20 @@ cargo build --release
 | `Esc` | Volver a NORMAL; desde NORMAL solicita cerrar |
 | `h`, `j`, `k`, `l` | Mover cursor |
 | `w`, `b` | Palabra siguiente / anterior |
+| `e` | Final de la palabra |
 | `0`, `$` | Inicio / final de línea |
 | `gg`, `G` | Inicio / final del archivo |
 | `o`, `O` | Crear línea debajo / arriba |
-| `x` | Borrar carácter siguiente |
-| `dd`, `yy`, `p` | Cortar línea, copiar línea, pegar |
-| `v` | VISUAL |
+| `x`, `X` | Borrar carácter siguiente / anterior |
+| `d`, `c`, `y` + movimiento | Borrar, cambiar o copiar un rango |
+| `dd`, `cc`, `yy`, `p`, `P` | Operar sobre líneas y pegar después / antes |
+| `v`, `V`, `Ctrl+V` | VISUAL carácter / línea / bloque |
+| `y`, `d`, `c`, `Ctrl+C` en VISUAL | Copiar, borrar o cambiar la selección |
+| `Ctrl+A` | Seleccionar todo el buffer |
+| `Ctrl+V` en INSERT | Pegar desde el portapapeles del sistema |
 | `u`, `Ctrl+r` | Deshacer / rehacer |
 | `Ctrl+l` | Insertar línea al final y entrar a INSERT |
+| `Ctrl+Enter` | Ejecutar solo la selección VISUAL |
 | `Ctrl+s` | Ejecutar consulta o guardar DDL |
 
 ## Seguridad de escritura

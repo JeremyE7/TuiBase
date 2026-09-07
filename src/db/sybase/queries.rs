@@ -5,7 +5,7 @@ use crate::db::{
         ColumnMetadata, DbObject, IndexMetadata, ObjectKind, TableIdentifier, TableMetadata,
         TablePage,
     },
-    query::{FilterOperator, PageCursor, SortDirection, SortSpec, TableQuery},
+    query::{FilterExpr, FilterOperator, PageCursor, SortDirection, SortSpec, TableQuery},
 };
 
 const ROW_MARKER: &str = "__ASE_TUI_ROW__|";
@@ -208,32 +208,21 @@ pub fn query_table(
 ) -> Result<String, String> {
     let table = qualified_identifier(&object.owner, &object.name);
     let sort = effective_sort_specs(query, columns, indexes);
-    let mut predicates = query
-        .filters
-        .iter()
-        .map(|filter| {
-            let data_type = columns
-                .iter()
-                .find(|(column, _)| column.eq_ignore_ascii_case(&filter.column))
-                .map(|(_, data_type)| data_type.as_str())
-                .ok_or_else(|| format!("no hay metadata para la columna {}", filter.column))?;
-            filter_sql(
-                filter.column.as_str(),
-                data_type,
-                filter.operator,
-                filter.value.as_deref(),
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if let Some(PageCursor::Keyset(values)) = query.page.cursor.as_ref()
-        && let Some(seek_clause) = keyset_where_clause(&sort, values, columns)?
-    {
-        predicates.push(seek_clause);
-    }
-    let where_clause = if predicates.is_empty() {
-        String::new()
+    let filter_clause = query
+        .filter
+        .as_ref()
+        .map(|filter| filter_expression_sql(filter, columns))
+        .transpose()?;
+    let seek_clause = if let Some(PageCursor::Keyset(values)) = query.page.cursor.as_ref() {
+        keyset_where_clause(&sort, values, columns)?
     } else {
-        format!("\nwhere {}", predicates.join("\n  and "))
+        None
+    };
+    let where_clause = match (filter_clause, seek_clause) {
+        (None, None) => String::new(),
+        (Some(filter), None) => format!("\nwhere {filter}"),
+        (None, Some(seek)) => format!("\nwhere {seek}"),
+        (Some(filter), Some(seek)) => format!("\nwhere ({filter})\n  and {seek}"),
     };
     let order_clause = if sort.is_empty() {
         String::new()
@@ -282,6 +271,51 @@ pub fn query_table(
         where_clause = where_clause,
         order_clause = order_clause,
     ))
+}
+
+fn filter_expression_sql(
+    expression: &FilterExpr,
+    columns: &[(String, String)],
+) -> Result<String, String> {
+    match expression {
+        FilterExpr::Condition(filter) => {
+            let data_type = columns
+                .iter()
+                .find(|(column, _)| column.eq_ignore_ascii_case(&filter.column))
+                .map(|(_, data_type)| data_type.as_str())
+                .ok_or_else(|| format!("no hay metadata para la columna {}", filter.column))?;
+            filter_sql(
+                filter.column.as_str(),
+                data_type,
+                filter.operator,
+                filter.value.as_deref(),
+            )
+        }
+        FilterExpr::And(expressions) => combine_filter_expressions(expressions, "and", columns),
+        FilterExpr::Or(expressions) => combine_filter_expressions(expressions, "or", columns),
+        FilterExpr::Not(expression) => Ok(format!(
+            "not ({})",
+            filter_expression_sql(expression, columns)?
+        )),
+    }
+}
+
+fn combine_filter_expressions(
+    expressions: &[FilterExpr],
+    operator: &str,
+    columns: &[(String, String)],
+) -> Result<String, String> {
+    if expressions.is_empty() {
+        return Err("la expresión de filtro no puede estar vacía".to_owned());
+    }
+    let rendered = expressions
+        .iter()
+        .map(|expression| filter_expression_sql(expression, columns))
+        .collect::<Result<Vec<_>, String>>()?;
+    if rendered.len() == 1 {
+        return Ok(rendered[0].clone());
+    }
+    Ok(format!("({})", rendered.join(&format!("\n  {operator} "))))
 }
 
 pub fn effective_sort_specs(
@@ -897,7 +931,9 @@ mod tests {
         models::{
             ColumnMetadata, DbObject, IndexMetadata, TableIdentifier, TableMetadata, TablePage,
         },
-        query::{FilterOperator, FilterSpec, PageCursor, PageRequest, SortSpec, TableQuery},
+        query::{
+            FilterExpr, FilterOperator, FilterSpec, PageCursor, PageRequest, SortSpec, TableQuery,
+        },
     };
 
     use super::{
@@ -1124,7 +1160,7 @@ mod tests {
         };
         let mut query = TableQuery::new(PageRequest::new(10).expect("valid page size"));
         query.sort.push(SortSpec::descending("created_at"));
-        query.filters.push(FilterSpec::new(
+        query.add_filter(FilterSpec::new(
             "status",
             FilterOperator::Contains,
             Some("active'"),
@@ -1157,10 +1193,8 @@ mod tests {
             kind: ObjectKind::Table,
         };
         let mut query = TableQuery::default();
-        query
-            .filters
-            .push(FilterSpec::new("id", FilterOperator::Equals, Some("42")));
-        query.filters.push(FilterSpec::new(
+        query.add_filter(FilterSpec::new("id", FilterOperator::Equals, Some("42")));
+        query.add_filter(FilterSpec::new(
             "amount",
             FilterOperator::GreaterThanOrEqual,
             Some("10.50"),
@@ -1183,6 +1217,84 @@ mod tests {
     }
 
     #[test]
+    fn renders_nested_boolean_filters_with_precedence() {
+        let object = DbObject {
+            owner: "dbo".to_owned(),
+            name: "orders".to_owned(),
+            kind: ObjectKind::Table,
+        };
+        let mut query = TableQuery::default();
+        query.filter = Some(FilterExpr::Or(vec![
+            FilterExpr::Condition(FilterSpec::new(
+                "status",
+                FilterOperator::Equals,
+                Some("active"),
+            )),
+            FilterExpr::And(vec![
+                FilterExpr::Condition(FilterSpec::new(
+                    "status",
+                    FilterOperator::Equals,
+                    Some("pending"),
+                )),
+                FilterExpr::Not(Box::new(FilterExpr::Condition(FilterSpec::new(
+                    "archived",
+                    FilterOperator::Equals,
+                    Some("1"),
+                )))),
+            ]),
+        ]));
+
+        let sql = query_table(
+            &object,
+            &query,
+            &[
+                ("status".to_owned(), "varchar".to_owned()),
+                ("archived".to_owned(), "bit".to_owned()),
+            ],
+            &[],
+        )
+        .expect("valid boolean filter");
+
+        assert!(
+            sql.contains("where ((\"status\" = 'active'")
+                || sql.contains("where (\"status\" = 'active'")
+        );
+        assert!(sql.contains("or (\"status\" = 'pending'"));
+        assert!(sql.contains("not (\"archived\" = 1)"));
+    }
+
+    #[test]
+    fn groups_user_filter_before_keyset_seek_predicate() {
+        let object = DbObject {
+            owner: "dbo".to_owned(),
+            name: "orders".to_owned(),
+            kind: ObjectKind::Table,
+        };
+        let mut query = TableQuery::new(PageRequest::new(10).expect("valid page size"));
+        query.add_filter(FilterSpec::new(
+            "status",
+            FilterOperator::Equals,
+            Some("active"),
+        ));
+        query.sort.push(SortSpec::ascending("id"));
+        query.page.cursor = Some(PageCursor::keyset(vec!["42".to_owned()]));
+
+        let sql = query_table(
+            &object,
+            &query,
+            &[
+                ("id".to_owned(), "int".to_owned()),
+                ("status".to_owned(), "varchar".to_owned()),
+            ],
+            &[],
+        )
+        .expect("valid filtered keyset query");
+
+        assert!(sql.contains("where (\"status\" = 'active')"));
+        assert!(sql.contains("\n  and (\"id\" > 42)"));
+    }
+
+    #[test]
     fn rejects_invalid_numeric_filter_values_before_sql_execution() {
         let object = DbObject {
             owner: "dbo".to_owned(),
@@ -1190,9 +1302,7 @@ mod tests {
             kind: ObjectKind::Table,
         };
         let mut query = TableQuery::default();
-        query
-            .filters
-            .push(FilterSpec::new("id", FilterOperator::Equals, Some("abc")));
+        query.add_filter(FilterSpec::new("id", FilterOperator::Equals, Some("abc")));
 
         let error = query_table(&object, &query, &[("id".to_owned(), "int".to_owned())], &[])
             .expect_err("invalid numeric filter must be rejected");
@@ -1208,12 +1318,12 @@ mod tests {
             kind: ObjectKind::Table,
         };
         let mut query = TableQuery::default();
-        query.filters.push(FilterSpec::new(
+        query.add_filter(FilterSpec::new(
             "payload",
             FilterOperator::Like,
             Some("0x%"),
         ));
-        query.filters.push(FilterSpec::new(
+        query.add_filter(FilterSpec::new(
             "notes",
             FilterOperator::Contains,
             Some("contract"),
@@ -1368,14 +1478,12 @@ mod tests {
             kind: ObjectKind::Table,
         };
         let mut query = TableQuery::default();
-        query.filters.push(FilterSpec::new(
+        query.add_filter(FilterSpec::new(
             "name",
             FilterOperator::Contains,
             Some("50%_off"),
         ));
-        query
-            .filters
-            .push(FilterSpec::new("code", FilterOperator::Like, Some("A%")));
+        query.add_filter(FilterSpec::new("code", FilterOperator::Like, Some("A%")));
 
         let sql = query_table(
             &object,

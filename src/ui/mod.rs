@@ -15,6 +15,7 @@ pub mod syntax;
 use crate::{
     app::{App, AppMode, Focus, TableCopyStage},
     db::models::ObjectKind,
+    editor::SelectionRange,
 };
 
 pub use syntax::highlight_sql;
@@ -24,13 +25,26 @@ const TABLE_COLUMN_WIDTH: usize = 18;
 const TABLE_COLUMN_SPACING: usize = 1;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
+    let shell = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(if app.sidebar_visible {
+            [Constraint::Percentage(28), Constraint::Percentage(72)]
+        } else {
+            [Constraint::Length(0), Constraint::Percentage(100)]
+        })
+        .split(frame.area());
+
+    if app.sidebar_visible {
+        render_sidebar(frame, shell[0], app);
+    }
+
     let content_area = if app.tabs.is_empty() {
-        frame.area()
+        shell[1]
     } else {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(frame.area());
+            .constraints([Constraint::Length(2), Constraint::Min(0)])
+            .split(shell[1]);
         render_tabs_bar(frame, chunks[0], app);
         chunks[1]
     };
@@ -87,51 +101,52 @@ fn render_tabs_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, tab)| {
-            let prefix = if idx == app.tabs.active { "● " } else { "○ " };
+            let prefix = if idx == app.tabs.active {
+                "● "
+            } else {
+                "○ "
+            };
             Line::from(format!("{}{}", prefix, tab.short_title()))
         })
         .collect();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
     let tabs = Tabs::new(titles)
         .select(app.tabs.active)
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .highlight_style(
             Style::default()
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         )
         .divider(Span::raw(" │ "));
-    let block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(tabs, inner);
+    frame.render_widget(tabs, rows[0]);
+
+    let help = Paragraph::new(
+        " : SQL libre · Ctrl+Tab siguiente · Ctrl+w cerrar · Ctrl+Enter ejecuta selección",
+    )
+    .style(Style::default().fg(Color::DarkGray))
+    .block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(help, rows[1]);
 }
 
-fn render_browser(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(1)])
-        .split(area);
-
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(18), Constraint::Percentage(82)])
-        .split(vertical[0]);
-
-    let sidebar = Layout::default()
+fn render_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(36),
-            Constraint::Percentage(30),
+            Constraint::Percentage(22),
+            Constraint::Percentage(22),
+            Constraint::Percentage(18),
+            Constraint::Percentage(38),
         ])
-        .split(main[0]);
-
-    let workspace = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(main[1]);
+        .split(area);
 
     let connections = app
         .config
@@ -144,7 +159,7 @@ fn render_browser(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect::<Vec<_>>();
     render_list(
         frame,
-        sidebar[0],
+        sections[0],
         "[1] Conexiones ",
         connections,
         app.connection_index,
@@ -158,7 +173,7 @@ fn render_browser(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect::<Vec<_>>();
     render_list(
         frame,
-        sidebar[1],
+        sections[1],
         "[2] Bases de datos ",
         databases,
         app.database_index,
@@ -171,8 +186,8 @@ fn render_browser(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect::<Vec<_>>();
     render_list(
         frame,
-        sidebar[2],
-        "[3] Objetos ",
+        sections[2],
+        "[3] Tipos ",
         kinds,
         app.kind_index,
         app.focus == Focus::Kinds,
@@ -185,12 +200,19 @@ fn render_browser(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect::<Vec<_>>();
     render_list(
         frame,
-        workspace[0],
+        sections[3],
         &format!("[4] {} ", app.current_kind()),
         objects,
         app.object_index,
         app.focus == Focus::Objects,
     );
+}
+
+fn render_browser(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(area);
 
     let displayed_content = app
         .highlighted_content
@@ -198,12 +220,12 @@ fn render_browser(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or_else(|| Text::from(app.content.clone()));
     let content = Paragraph::new(displayed_content)
         .block(panel_block(
-            format!("[5] {} ", app.content_title),
-            app.focus == Focus::Content,
+            format!("[Contenido activo] {} ", app.content_title),
+            true,
         ))
         .wrap(Wrap { trim: false })
         .scroll((app.content_scroll, 0));
-    frame.render_widget(content, workspace[1]);
+    frame.render_widget(content, vertical[0]);
 
     render_status(frame, vertical[1], app);
 }
@@ -823,7 +845,7 @@ fn render_table_filter_overlay(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Clear, area);
 
     let outer = panel_block(
-        " Filtrar tabla · Tab completa · Enter aplica · Esc cancela ",
+        " Filtrar tabla · AND/OR/NOT · (paréntesis) · Tab completa · Enter aplica · Esc cancela ",
         true,
     );
     let inner = outer.inner(area);
@@ -1108,11 +1130,7 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             session.editor.mode,
             cursor_row + 1,
             cursor_col + 1,
-            if session.editor.is_dirty() {
-                "[+]"
-            } else {
-                ""
-            }
+            if session.editor.is_dirty() { "[+]" } else { "" }
         );
         let block = panel_block(title, true);
         let inner = block.inner(editor_layout[0]);
@@ -1139,15 +1157,19 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let scroll = session.editor.scroll;
             let content = session.editor.text();
             let base = crate::ui::syntax::highlight_sql(&content);
-            let selection = session.editor.textarea.selection_range();
+            let selection = session.editor.selection_for_render();
             let orig_lines: Vec<String> = session.editor.textarea.lines().iter().cloned().collect();
             let highlighted = apply_editor_selection(base, &orig_lines, selection);
             let paragraph = Paragraph::new(highlighted)
                 .wrap(Wrap { trim: false })
                 .scroll(scroll);
             frame.render_widget(paragraph, inner);
-            let cursor_x = inner.x.saturating_add((cursor_col as u16).saturating_sub(scroll.1));
-            let cursor_y = inner.y.saturating_add((cursor_row as u16).saturating_sub(scroll.0));
+            let cursor_x = inner
+                .x
+                .saturating_add((cursor_col as u16).saturating_sub(scroll.1));
+            let cursor_y = inner
+                .y
+                .saturating_add((cursor_row as u16).saturating_sub(scroll.0));
             if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
                 frame.set_cursor_position((cursor_x, cursor_y));
             }
@@ -1199,11 +1221,13 @@ fn console_text(app: &App) -> Text<'static> {
 fn apply_editor_selection(
     base: Text<'static>,
     orig_lines: &[String],
-    selection: Option<((usize, usize), (usize, usize))>,
+    selection: Option<SelectionRange>,
 ) -> Text<'static> {
-    let Some(((sr, sc), (er, ec))) = selection else {
+    let Some(selection) = selection else {
         return base;
     };
+    let (sr, sc) = selection.start;
+    let (er, ec) = selection.end;
     let mut base_lines = base.lines;
     if base_lines.len() < orig_lines.len() {
         base_lines.resize_with(orig_lines.len(), Line::default);
@@ -1211,16 +1235,30 @@ fn apply_editor_selection(
         base_lines.truncate(orig_lines.len());
     }
     let mut out_lines: Vec<Line<'static>> = Vec::with_capacity(base_lines.len());
-    for (row, (mut base_line, orig_line)) in base_lines.into_iter().zip(orig_lines.iter()).enumerate() {
+    for (row, (mut base_line, orig_line)) in
+        base_lines.into_iter().zip(orig_lines.iter()).enumerate()
+    {
         if row < sr || row > er {
             out_lines.push(base_line);
             continue;
         }
-        let line_start = if row == sr { sc } else { 0 };
-        let line_end = if row == er {
-            ec
-        } else {
-            orig_line.chars().count()
+        let (line_start, line_end) = match selection.mode {
+            crate::editor::VisualMode::Character => (
+                if row == sr { sc } else { 0 },
+                if row == er {
+                    ec
+                } else {
+                    orig_line.chars().count()
+                },
+            ),
+            crate::editor::VisualMode::Line => (0, orig_line.chars().count()),
+            crate::editor::VisualMode::Block => {
+                if row < sr || row > er {
+                    (0, 0)
+                } else {
+                    (sc, ec.min(orig_line.chars().count()))
+                }
+            }
         };
         if line_start >= line_end {
             out_lines.push(base_line);

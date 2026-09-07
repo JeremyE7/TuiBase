@@ -12,6 +12,12 @@ pub struct Tab {
     pub owner: String,
     pub name: String,
     pub kind: TabKind,
+    #[serde(default)]
+    pub editor_text: Option<String>,
+    #[serde(default)]
+    pub table_filter: String,
+    #[serde(default)]
+    pub table_sort: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +27,7 @@ pub enum TabKind {
     Procedure,
     Function,
     View,
+    Query,
 }
 
 impl TabKind {
@@ -33,12 +40,13 @@ impl TabKind {
         }
     }
 
-    fn object_kind(self) -> ObjectKind {
+    fn object_kind(self) -> Option<ObjectKind> {
         match self {
-            Self::Table => ObjectKind::Table,
-            Self::Procedure => ObjectKind::Procedure,
-            Self::Function => ObjectKind::Function,
-            Self::View => ObjectKind::View,
+            Self::Table => Some(ObjectKind::Table),
+            Self::Procedure => Some(ObjectKind::Procedure),
+            Self::Function => Some(ObjectKind::Function),
+            Self::View => Some(ObjectKind::View),
+            Self::Query => None,
         }
     }
 
@@ -48,6 +56,7 @@ impl TabKind {
             Self::Procedure => "Proc",
             Self::Function => "Func",
             Self::View => "Vista",
+            Self::Query => "SQL",
         }
     }
 }
@@ -60,23 +69,45 @@ impl Tab {
             owner: object.owner.clone(),
             name: object.name.clone(),
             kind: TabKind::from_object_kind(object.kind),
+            editor_text: None,
+            table_filter: String::new(),
+            table_sort: String::new(),
         }
     }
 
-    pub fn to_object(&self) -> DbObject {
-        DbObject {
+    pub fn to_object(&self) -> Option<DbObject> {
+        Some(DbObject {
             owner: self.owner.clone(),
             name: self.name.clone(),
-            kind: self.kind.object_kind(),
-        }
+            kind: self.kind.object_kind()?,
+        })
     }
 
     pub fn title(&self) -> String {
+        if self.kind == TabKind::Query {
+            return format!("{} · {}", self.database, self.name);
+        }
         format!("{} · {}.{}", self.database, self.owner, self.name)
     }
 
     pub fn short_title(&self) -> String {
+        if self.kind == TabKind::Query {
+            return self.name.clone();
+        }
         format!("{}.{}", self.owner, self.name)
+    }
+
+    pub fn query(id: u64, database: String, text: String) -> Self {
+        Self {
+            id,
+            database,
+            owner: String::new(),
+            name: format!("SQL #{}", id),
+            kind: TabKind::Query,
+            editor_text: Some(text),
+            table_filter: String::new(),
+            table_sort: String::new(),
+        }
     }
 }
 
@@ -142,15 +173,9 @@ impl TabsState {
     }
 
     pub fn push(&mut self, database: String, object: &DbObject) -> u64 {
-        // avoid duplicate consecutive same object in same db
-        if let Some(active) = self.active() {
-            if active.database == database
-                && active.owner == object.owner
-                && active.name == object.name
-                && active.kind == TabKind::from_object_kind(object.kind)
-            {
-                return active.id;
-            }
+        if let Some(index) = self.find_index(&database, object) {
+            self.active = index;
+            return self.tabs[index].id;
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -158,6 +183,24 @@ impl TabsState {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         id
+    }
+
+    pub fn push_query(&mut self, database: String, text: String) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.tabs.push(Tab::query(id, database, text));
+        self.active = self.tabs.len() - 1;
+        id
+    }
+
+    pub fn find_index(&self, database: &str, object: &DbObject) -> Option<usize> {
+        let kind = TabKind::from_object_kind(object.kind);
+        self.tabs.iter().position(|tab| {
+            tab.database == database
+                && tab.owner == object.owner
+                && tab.name == object.name
+                && tab.kind == kind
+        })
     }
 
     pub fn close(&mut self, index: usize) -> bool {
