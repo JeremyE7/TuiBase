@@ -94,6 +94,7 @@ impl IsqlBackend {
             stderr,
             success: output.status.success() && !sql_error,
             elapsed_ms: 0,
+            table: None,
         })
     }
 
@@ -406,7 +407,11 @@ impl DatabaseBackend for IsqlBackend {
     }
 
     fn execute(&self, profile: &ConnectionProfile, database: &str, sql: &str) -> Result<SqlOutput> {
-        self.run_sql(profile, database, sql)
+        let mut output = self.run_sql(profile, database, sql)?;
+        if output.success {
+            output.table = parse_sql_result(&output.stdout);
+        }
+        Ok(output)
     }
 }
 
@@ -464,6 +469,69 @@ fn parse_table_preview(table: &str) -> Result<TablePreview> {
     }
 
     Ok(TablePreview { columns, rows })
+}
+
+fn parse_sql_result(output: &str) -> Option<TablePreview> {
+    let lines = output.lines().collect::<Vec<_>>();
+    let separator_index = lines
+        .iter()
+        .position(|line| is_sql_column_separator(line))?;
+    let header_index =
+        lines[..separator_index]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, line)| {
+                let trimmed = line.trim();
+                (!trimmed.is_empty() && !is_sql_row_count(trimmed)).then_some(index)
+            })?;
+    let columns = parse_sql_fields(lines[header_index]);
+    if columns.is_empty() || columns.iter().all(String::is_empty) {
+        return None;
+    }
+
+    let mut rows = Vec::new();
+    for line in lines.iter().skip(separator_index + 1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_sql_row_count(trimmed) || is_sql_column_separator(trimmed) {
+            break;
+        }
+        let values = parse_sql_fields(trimmed);
+        if values.len() != columns.len() {
+            return None;
+        }
+        rows.push(values);
+    }
+
+    Some(TablePreview { columns, rows })
+}
+
+fn parse_sql_fields(line: &str) -> Vec<String> {
+    let line = line.trim();
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').unwrap_or(line);
+    line.split('|')
+        .map(|field| field.trim().to_owned())
+        .collect()
+}
+
+fn is_sql_column_separator(line: &str) -> bool {
+    let fields = parse_sql_fields(line);
+    !fields.is_empty()
+        && fields.iter().all(|field| {
+            !field.is_empty()
+                && field
+                    .chars()
+                    .all(|character| matches!(character, '-' | '=' | '+'))
+        })
+}
+
+fn is_sql_row_count(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with('(') && lower.ends_with("affected)") && lower.contains("row")
 }
 
 fn parse_optional_u32(value: &str) -> Option<u32> {
@@ -621,7 +689,7 @@ mod tests {
 
     use super::{
         format_column_type, keyset_cursor_values, parse_fields, parse_sp_helpindex,
-        parse_table_metadata, parse_table_preview, quote_display_identifier,
+        parse_sql_result, parse_table_metadata, parse_table_preview, quote_display_identifier,
     };
 
     #[test]
@@ -660,6 +728,45 @@ mod tests {
 
         assert_eq!(preview.columns, ["name", "notes"]);
         assert_eq!(preview.rows, vec![vec!["one|two", "line\nnext"]]);
+    }
+
+    #[test]
+    fn parses_plain_isql_results_into_columns_and_rows() {
+        let output = "id | name\n---|------\n1  | Ada\n2  | Grace\n(2 rows affected)\n";
+
+        let result = parse_sql_result(output).expect("tabular isql output");
+
+        assert_eq!(result.columns, ["id", "name"]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec!["1".to_owned(), "Ada".to_owned()],
+                vec!["2".to_owned(), "Grace".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_empty_single_column_results() {
+        let output = "name\n----\n(0 rows affected)\n";
+
+        let result = parse_sql_result(output).expect("header-only tabular output");
+
+        assert_eq!(result.columns, ["name"]);
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn ignores_non_tabular_isql_output() {
+        assert!(parse_sql_result("(1 row affected)\n").is_none());
+        assert!(parse_sql_result("Comando ejecutado sin salida.\n").is_none());
+    }
+
+    #[test]
+    fn rejects_rows_with_inconsistent_column_counts() {
+        let output = "id | name\n---|----\n1|Ada|extra\n";
+
+        assert!(parse_sql_result(output).is_none());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::catalog::{CatalogCache, CatalogEntry, SearchCatalogEntry, connection_key};
-use crate::db::models::{ColumnMetadata, TableMetadata, TablePage};
+use crate::db::models::{ColumnMetadata, TableMetadata, TablePage, TablePreview};
 use crate::services;
 use crate::table_preferences::{TablePreferences, table_preference_key};
 use crate::tabs::TabsState;
@@ -251,6 +251,7 @@ pub struct App {
     pub content_scroll: u16,
     pub console_elapsed_ms: Option<u64>,
     pub console_success: Option<bool>,
+    pub sql_result: Option<TablePreview>,
     pub status: String,
     pub last_key: String,
     pub editor: Option<EditorSession>,
@@ -345,6 +346,7 @@ impl App {
             content_scroll: 0,
             console_elapsed_ms: None,
             console_success: None,
+            sql_result: None,
             status: "Listo".to_owned(),
             table_page: None,
             table_metadata: None,
@@ -3913,6 +3915,7 @@ impl App {
         self.content_title = "Resultado de ejecución".to_owned();
         self.content.clear();
         self.content_scroll = 0;
+        self.sql_result = None;
         self.mode = AppMode::Editor;
         self.status = "Editor NORMAL · i para insertar · Ctrl+S para ejecutar".to_owned();
     }
@@ -3937,6 +3940,7 @@ impl App {
         self.content_title = "Resultado de ejecución".to_owned();
         self.content.clear();
         self.content_scroll = 0;
+        self.sql_result = None;
         self.mode = AppMode::Editor;
         self.status = "Editor NORMAL · i para insertar · Ctrl+S para ejecutar".to_owned();
     }
@@ -3951,6 +3955,7 @@ impl App {
         self.content_title = "Resultado de ejecución".to_owned();
         self.content.clear();
         self.content_scroll = 0;
+        self.sql_result = None;
         self.mode = AppMode::Editor;
         self.status = "Editor NORMAL · Ctrl+S propone guardar · Esc cierra".to_owned();
     }
@@ -4003,6 +4008,7 @@ impl App {
 
     fn dispatch_execute(&mut self, sql: String) {
         self.return_to_table_after_execution = false;
+        self.sql_result = None;
         let Some(profile) = self.current_profile().cloned() else {
             return;
         };
@@ -4515,8 +4521,10 @@ impl App {
                         self.console_success = Some(output.success);
                         let combined = output.combined();
                         let line_count = combined.lines().count();
+                        let sql_result = output.table.clone();
                         self.content = combined;
                         self.content_scroll = 0;
+                        self.sql_result = output.success.then_some(sql_result).flatten();
                         self.highlighted_content = None;
                         self.table_page = None;
                         self.table_metadata = None;
@@ -4526,22 +4534,39 @@ impl App {
                         self.column_search_session = None;
                         self.table_show_metadata = false;
                         let status_icon = if output.success { "✓" } else { "✗" };
-                        self.content_title = format!(
-                            "Consola · {database} · {elapsed}ms · {line_count} líneas {status_icon}"
-                        );
+                        if let Some(table) = self.sql_result.as_ref() {
+                            let result_count = table.rows.len();
+                            let column_count = table.columns.len();
+                            self.content_title = format!(
+                                "Resultados · {database} · {elapsed}ms · {result_count} filas · {column_count} cols {status_icon}"
+                            );
+                        } else {
+                            self.content_title = format!(
+                                "Consola · {database} · {elapsed}ms · {line_count} líneas {status_icon}"
+                            );
+                        }
                         if output.success {
                             if let Some(session) = self.editor.as_mut() {
                                 session.editor.mark_clean();
                             }
-                            self.status = format!(
-                                "T-SQL OK · {elapsed}ms · {line_count} líneas · {status_icon}"
-                            );
+                            self.status = if let Some(table) = self.sql_result.as_ref() {
+                                format!(
+                                    "T-SQL OK · {elapsed}ms · {} filas · {} columnas · {status_icon}",
+                                    table.rows.len(),
+                                    table.columns.len(),
+                                )
+                            } else {
+                                format!(
+                                    "T-SQL OK · {elapsed}ms · {line_count} líneas · {status_icon}"
+                                )
+                            };
                         } else {
                             self.status = format!("ASE/isql ERROR · {elapsed}ms {status_icon}");
                         }
                     }
                     Err(error) => {
                         self.console_success = Some(false);
+                        self.sql_result = None;
                         let line_count = error.lines().count();
                         self.content = error.clone();
                         self.content_scroll = 0;
@@ -6173,18 +6198,21 @@ mod tests {
             stderr: String::new(),
             success: true,
             elapsed_ms: 0,
+            table: None,
         };
         let rolled_back = SqlOutput {
             stdout: crate::db::sybase::queries::staged_rolled_back_marker().to_owned(),
             stderr: String::new(),
             success: true,
             elapsed_ms: 0,
+            table: None,
         };
         let process_failed_with_commit_marker = SqlOutput {
             stdout: crate::db::sybase::queries::staged_committed_marker().to_owned(),
             stderr: String::new(),
             success: false,
             elapsed_ms: 0,
+            table: None,
         };
 
         assert!(table_execution_committed(&committed));
@@ -6291,11 +6319,21 @@ mod tests {
                 stderr: String::new(),
                 success: true,
                 elapsed_ms: 1,
+                table: Some(crate::db::models::TablePreview {
+                    columns: vec!["id".to_owned()],
+                    rows: vec![vec!["1".to_owned()]],
+                }),
             }),
             elapsed_ms: 1,
         });
 
         assert_eq!(app.content, "ok");
+        assert_eq!(
+            app.sql_result
+                .as_ref()
+                .map(|result| result.columns.as_slice()),
+            Some(["id".to_owned()].as_slice())
+        );
         assert_eq!(app.mode, AppMode::Editor);
     }
 

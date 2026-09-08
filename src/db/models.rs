@@ -182,6 +182,7 @@ pub struct SqlOutput {
     pub stderr: String,
     pub success: bool,
     pub elapsed_ms: u64,
+    pub table: Option<TablePreview>,
 }
 
 impl SqlOutput {

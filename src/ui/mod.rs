@@ -1182,14 +1182,63 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
     }
 
-    let console = console_text(app);
-    let result = Paragraph::new(console)
-        .block(panel_block(format!(" {} ", app.content_title), false))
-        .wrap(Wrap { trim: false })
-        .scroll((app.content_scroll, 0));
-    frame.render_widget(result, editor_layout[1]);
+    if app.sql_result.is_some() {
+        render_sql_result(frame, editor_layout[1], app);
+    } else {
+        let console = console_text(app);
+        let result = Paragraph::new(console)
+            .block(panel_block(format!(" {} ", app.content_title), false))
+            .wrap(Wrap { trim: false })
+            .scroll((app.content_scroll, 0));
+        frame.render_widget(result, editor_layout[1]);
+    }
 
     render_status(frame, vertical[1], app);
+}
+
+fn render_sql_result(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(result) = app.sql_result.as_ref() else {
+        return;
+    };
+    let available_width = area.width.saturating_sub(2) as usize;
+    let visible_columns = ((available_width + TABLE_COLUMN_SPACING)
+        / (TABLE_COLUMN_WIDTH + TABLE_COLUMN_SPACING))
+        .max(1)
+        .min(result.columns.len());
+    let column_range = 0..visible_columns;
+    let hidden_columns = result.columns.len().saturating_sub(visible_columns);
+    let column_summary = if hidden_columns == 0 {
+        String::new()
+    } else {
+        format!(
+            " · mostrando {visible_columns}/{} cols",
+            result.columns.len()
+        )
+    };
+    let block = panel_block(format!(" {}{} ", app.content_title, column_summary), false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let header = Row::new(
+        column_range
+            .clone()
+            .map(|index| result.columns[index].clone()),
+    )
+    .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows = result.rows.iter().map(|values| {
+        Row::new(
+            column_range
+                .clone()
+                .map(|index| values.get(index).cloned().unwrap_or_default()),
+        )
+    });
+    let table = Table::new(
+        rows,
+        vec![Constraint::Length(TABLE_COLUMN_WIDTH as u16); visible_columns],
+    )
+    .header(header)
+    .column_spacing(TABLE_COLUMN_SPACING as u16);
+    frame.render_widget(table, inner);
 }
 
 fn console_text(app: &App) -> Text<'static> {
