@@ -8,7 +8,7 @@ use crate::catalog::{CatalogCache, CatalogEntry, SearchCatalogEntry, connection_
 use crate::db::models::{ColumnMetadata, TableMetadata, TablePage, TablePreview};
 use crate::services;
 use crate::table_preferences::{TablePreferences, table_preference_key};
-use crate::tabs::TabsState;
+use crate::tabs::{TabEditorState, TabsState};
 use crate::ui;
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -224,6 +224,11 @@ pub struct EditorCompletionSession {
     pub trigger_col: usize,
 }
 
+struct EditorHighlightCache {
+    source: String,
+    highlighted: Text<'static>,
+}
+
 #[derive(Debug, Clone)]
 enum ConfirmAction {
     Execute { sql: String },
@@ -293,6 +298,7 @@ pub struct App {
     sort_session: Option<SortSession>,
     column_search_session: Option<ColumnSearchSession>,
     pub editor_completion: Option<EditorCompletionSession>,
+    editor_highlight_cache: Option<EditorHighlightCache>,
     column_cache: HashMap<String, Vec<ColumnMetadata>>,
     pub tabs: TabsState,
     pending_table_filter: Option<String>,
@@ -383,6 +389,7 @@ impl App {
             sort_session: None,
             column_search_session: None,
             editor_completion: None,
+            editor_highlight_cache: None,
             column_cache: HashMap::new(),
             tabs: TabsState::load().unwrap_or_default(),
             pending_table_filter: None,
@@ -522,6 +529,23 @@ impl App {
 
     pub fn confirm_message(&self) -> &str {
         &self.confirm_message
+    }
+
+    pub(crate) fn highlighted_editor_text(&mut self, source: &str) -> Text<'static> {
+        if let Some(cache) = self
+            .editor_highlight_cache
+            .as_ref()
+            .filter(|cache| cache.source == source)
+        {
+            return cache.highlighted.clone();
+        }
+
+        let highlighted = ui::highlight_sql(source);
+        self.editor_highlight_cache = Some(EditorHighlightCache {
+            source: source.to_owned(),
+            highlighted: highlighted.clone(),
+        });
+        highlighted
     }
 
     pub fn active_search_label(&self) -> Option<String> {
@@ -685,6 +709,11 @@ impl App {
     }
 
     fn persist_active_editor(&mut self) {
+        let editor_state = self.editor.as_ref().map(|session| TabEditorState {
+            cursor: session.editor.cursor_position(),
+            scroll: session.editor.scroll,
+            dirty: session.editor.is_dirty(),
+        });
         let editor_text = self.editor.as_ref().map(|editor| editor.editor.text());
         let filter = self.table_filter_expression.clone();
         let sort = format_sort_expression(&self.table_query.sort);
@@ -692,8 +721,12 @@ impl App {
             if tab.kind == crate::tabs::TabKind::Table {
                 tab.table_filter = filter;
                 tab.table_sort = sort;
-            } else if let Some(editor_text) = editor_text {
+            } else if let (Some(editor_text), Some(editor_state)) = (editor_text, editor_state) {
+                if !editor_state.dirty || tab.editor_base_text.is_none() {
+                    tab.editor_base_text = Some(editor_text.clone());
+                }
                 tab.editor_text = Some(editor_text);
+                tab.editor_state = editor_state;
             }
             let _ = self.tabs.save();
         }
@@ -704,7 +737,11 @@ impl App {
             return;
         };
         if tab.kind == crate::tabs::TabKind::Query {
-            self.open_query_tab_editor(tab.database, tab.editor_text.unwrap_or_default());
+            self.open_query_tab_editor(
+                tab.database,
+                tab.editor_text.unwrap_or_default(),
+                tab.editor_state,
+            );
         } else if let Some(object) = tab.to_object() {
             self.load_tab_by_object(tab.database, object);
         }
@@ -853,10 +890,9 @@ impl App {
         if key.code == KeyCode::Char('K')
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
-            && self
-                .editor
-                .as_ref()
-                .is_some_and(|s| s.editor.mode == crate::editor::VimMode::Normal)
+            && self.editor.as_ref().is_some_and(|s| {
+                s.editor.mode == crate::editor::VimMode::Normal && !s.editor.has_visual_selection()
+            })
         {
             self.show_editor_hover();
             return;
@@ -911,6 +947,7 @@ impl App {
                             .to_owned();
                     self.mode = AppMode::Confirm;
                 } else {
+                    self.persist_active_editor();
                     self.editor = None;
                     self.mode = AppMode::Browser;
                 }
@@ -3580,6 +3617,15 @@ impl App {
                     ConfirmAction::Execute { sql } => self.dispatch_execute(sql),
                     ConfirmAction::ExecuteTableChanges { sql } => self.dispatch_table_changes(sql),
                     ConfirmAction::DiscardEditor => {
+                        if let Some(tab) = self.tabs.tabs.get_mut(self.tabs.active) {
+                            if tab.kind != crate::tabs::TabKind::Table {
+                                if let Some(base_text) = tab.editor_base_text.clone() {
+                                    tab.editor_text = Some(base_text);
+                                    tab.editor_state = TabEditorState::default();
+                                }
+                            }
+                        }
+                        let _ = self.tabs.save();
                         self.editor = None;
                         self.mode = AppMode::Browser;
                         self.status = "Cambios descartados".to_owned();
@@ -3928,14 +3974,21 @@ impl App {
         );
         self.tabs.push_query(database.clone(), template.clone());
         let _ = self.tabs.save();
-        self.open_query_tab_editor(database, template);
+        self.open_query_tab_editor(database, template, TabEditorState::default());
     }
 
-    fn open_query_tab_editor(&mut self, database: String, text: String) {
+    fn open_query_tab_editor(
+        &mut self,
+        database: String,
+        text: String,
+        editor_state: TabEditorState,
+    ) {
+        let mut editor = VimEditor::new(text);
+        editor.restore_state(editor_state.cursor, editor_state.scroll, editor_state.dirty);
         self.editor = Some(EditorSession {
             title: format!("Consulta T-SQL · {database}"),
             purpose: EditorPurpose::Query,
-            editor: VimEditor::new(text),
+            editor,
         });
         self.content_title = "Resultado de ejecución".to_owned();
         self.content.clear();
@@ -3947,10 +4000,22 @@ impl App {
 
     fn open_object_editor(&mut self, object: DbObject, definition: String) {
         let definition = normalize_definition_for_edit(&definition);
+        let editor_state = self
+            .tabs
+            .active()
+            .map(|tab| tab.editor_state.clone())
+            .unwrap_or_default();
+        let mut editor = VimEditor::new(definition.clone());
+        editor.restore_state(editor_state.cursor, editor_state.scroll, editor_state.dirty);
+        if let Some(tab) = self.tabs.tabs.get_mut(self.tabs.active) {
+            if tab.kind != crate::tabs::TabKind::Table && tab.editor_base_text.is_none() {
+                tab.editor_base_text = Some(definition);
+            }
+        }
         self.editor = Some(EditorSession {
             title: format!("Editar {} · {}", object.kind, object.qualified_name()),
             purpose: EditorPurpose::ObjectDefinition(object),
-            editor: VimEditor::new(definition),
+            editor,
         });
         self.content_title = "Resultado de ejecución".to_owned();
         self.content.clear();
@@ -4549,6 +4614,7 @@ impl App {
                             if let Some(session) = self.editor.as_mut() {
                                 session.editor.mark_clean();
                             }
+                            self.persist_active_editor();
                             self.status = if let Some(table) = self.sql_result.as_ref() {
                                 format!(
                                     "T-SQL OK · {elapsed}ms · {} filas · {} columnas · {status_icon}",
@@ -5843,6 +5909,91 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+
+    fn editor_test_app() -> App {
+        let config = AppConfig {
+            connections: vec![ConnectionProfile {
+                name: "test".to_owned(),
+                backend: "sybase_isql".to_owned(),
+                isql_path: "isql".to_owned(),
+                userstore_key: Some("test".to_owned()),
+                server: None,
+                username: None,
+                password_env: None,
+                database: Some("master".to_owned()),
+                charset: None,
+                allow_writes: true,
+                extra_args: Vec::new(),
+            }],
+            catalog_ttl_hours: 24,
+        };
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (_response_tx, response_rx) = crossbeam_channel::unbounded();
+        App::new(
+            config,
+            PathBuf::from("connections.toml"),
+            request_tx,
+            response_rx,
+        )
+    }
+
+    #[test]
+    fn clean_editor_escape_does_not_close_or_prompt() {
+        let mut app = editor_test_app();
+        app.editor = Some(EditorSession {
+            title: "Consulta".to_owned(),
+            purpose: EditorPurpose::Query,
+            editor: VimEditor::new("select 1"),
+        });
+        app.mode = AppMode::Editor;
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, AppMode::Editor);
+        assert!(app.editor.is_some());
+        assert_eq!(
+            app.editor.as_ref().unwrap().editor.mode,
+            crate::editor::VimMode::Normal
+        );
+    }
+
+    #[test]
+    fn clean_editor_q_returns_to_browser() {
+        let mut app = editor_test_app();
+        app.tabs = TabsState::default();
+        app.editor = Some(EditorSession {
+            title: "Consulta".to_owned(),
+            purpose: EditorPurpose::Query,
+            editor: VimEditor::new("select 1"),
+        });
+        app.mode = AppMode::Editor;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, AppMode::Browser);
+        assert!(app.editor.is_none());
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn dirty_editor_q_requests_discard_confirmation() {
+        let mut app = editor_test_app();
+        app.editor = Some(EditorSession {
+            title: "Consulta".to_owned(),
+            purpose: EditorPurpose::Query,
+            editor: VimEditor::new("select 1"),
+        });
+        app.mode = AppMode::Editor;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, AppMode::Confirm);
+        assert!(app.editor.is_some());
+        assert!(app.confirm_message().contains("cambios sin ejecutar"));
+    }
 
     #[test]
     fn detects_writes_conservatively() {

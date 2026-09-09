@@ -42,7 +42,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         update_cursor_style(app)?;
         terminal.draw(|frame| ui::render(frame, app))?;
 
-        if event::poll(Duration::from_millis(80)).context("No se pudo consultar eventos")? {
+        if event::poll(Duration::from_millis(16)).context("No se pudo consultar eventos")? {
             match event::read().context("No se pudo leer el evento del terminal")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
                 Event::Resize(_, _) => {}

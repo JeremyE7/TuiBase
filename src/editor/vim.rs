@@ -2,18 +2,17 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::{CursorMove, Input, TextArea};
 
 use super::{
+    SelectionRange,
     buffer::{char_len, char_slice, ordered_positions, selected_text, selection_range, split_text},
     commands::{Operator, VisualMode},
     registers::{RegisterBank, RegisterKind, RegisterValue},
     undo::{Snapshot, UndoManager},
-    SelectionRange,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VimMode {
     Normal,
     Insert,
-    Visual,
 }
 
 impl std::fmt::Display for VimMode {
@@ -21,7 +20,6 @@ impl std::fmt::Display for VimMode {
         let label = match self {
             Self::Normal => "NORMAL",
             Self::Insert => "INSERT",
-            Self::Visual => "VISUAL",
         };
         f.write_str(label)
     }
@@ -94,6 +92,27 @@ impl VimEditor {
         self.dirty = true;
     }
 
+    pub fn restore_state(&mut self, cursor: (usize, usize), scroll: (u16, u16), dirty: bool) {
+        self.mode = VimMode::Normal;
+        self.visual_anchor = None;
+        self.textarea.cancel_selection();
+        self.clear_pending();
+        self.insert_snapshot = None;
+
+        let row = cursor.0.min(self.textarea.lines().len().saturating_sub(1));
+        let column = cursor.1.min(char_len(&self.textarea.lines()[row]));
+        self.textarea.move_cursor(CursorMove::Jump(
+            row.min(u16::MAX as usize) as u16,
+            column.min(u16::MAX as usize) as u16,
+        ));
+        self.scroll = scroll;
+        self.dirty = dirty;
+    }
+
+    pub fn has_visual_selection(&self) -> bool {
+        self.visual_anchor.is_some()
+    }
+
     pub fn paste_external_text(&mut self, text: &str) {
         if self.mode == VimMode::Insert {
             if self.textarea.insert_str(text) {
@@ -152,7 +171,7 @@ impl VimEditor {
             if self.mode == VimMode::Insert {
                 return EditorCommand::PasteFromClipboard;
             }
-            if self.mode == VimMode::Visual {
+            if self.has_visual_selection() {
                 self.visual_mode = if self.visual_mode == VisualMode::Block {
                     VisualMode::Character
                 } else {
@@ -163,14 +182,17 @@ impl VimEditor {
             }
             return EditorCommand::None;
         }
-        if ctrl && key.code == KeyCode::Char('c') && self.mode == VimMode::Visual {
+        if ctrl && key.code == KeyCode::Char('c') && self.has_visual_selection() {
             return self.yank_visual();
+        }
+
+        if self.has_visual_selection() {
+            return self.handle_visual(key);
         }
 
         match self.mode {
             VimMode::Insert => self.handle_insert(key),
             VimMode::Normal => self.handle_normal(key),
-            VimMode::Visual => self.handle_visual(key),
         }
     }
 
@@ -228,6 +250,11 @@ impl VimEditor {
         }
 
         if key.code == KeyCode::Esc {
+            self.clear_pending();
+            return EditorCommand::None;
+        }
+
+        if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
             self.clear_pending();
             return EditorCommand::Close;
         }
@@ -400,6 +427,11 @@ impl VimEditor {
             return EditorCommand::None;
         }
 
+        if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
+            self.cancel_visual();
+            return EditorCommand::Close;
+        }
+
         if self.is_count_key(key) {
             self.count_buffer.push(key_char(key));
             return EditorCommand::None;
@@ -534,7 +566,7 @@ impl VimEditor {
 
     fn paste(&mut self, before: bool) -> EditorCommand {
         let Some(register) = self.registers.unnamed().cloned() else {
-            return EditorCommand::None;
+            return EditorCommand::PasteFromClipboard;
         };
         self.with_change(|editor| editor.insert_register(&register, before));
         EditorCommand::None
@@ -644,7 +676,7 @@ impl VimEditor {
 
     fn start_visual(&mut self, mode: VisualMode) {
         self.finish_insert_change();
-        self.mode = VimMode::Visual;
+        self.mode = VimMode::Normal;
         self.visual_mode = mode;
         self.visual_anchor = Some(self.cursor_position());
         self.textarea.cancel_selection();
@@ -652,7 +684,7 @@ impl VimEditor {
     }
 
     fn select_all(&mut self) {
-        self.mode = VimMode::Visual;
+        self.mode = VimMode::Normal;
         self.visual_mode = VisualMode::Character;
         self.visual_anchor = Some((0, 0));
         self.textarea
@@ -804,6 +836,8 @@ impl VimEditor {
 
     fn enter_insert(&mut self) {
         self.finish_insert_change();
+        self.visual_anchor = None;
+        self.textarea.cancel_selection();
         self.insert_snapshot = Some(self.snapshot());
         self.mode = VimMode::Insert;
         self.clear_pending_except_mode();
@@ -826,7 +860,7 @@ impl VimEditor {
         }
     }
 
-    fn cursor_position(&self) -> (usize, usize) {
+    pub fn cursor_position(&self) -> (usize, usize) {
         let cursor = self.textarea.cursor();
         (cursor.0, cursor.1)
     }
@@ -900,7 +934,7 @@ mod tests {
         let mut editor = VimEditor::new("select\nsecond");
         editor.handle_key(ctrl('a'));
 
-        assert_eq!(editor.mode, VimMode::Visual);
+        assert_eq!(editor.mode, VimMode::Normal);
         assert_eq!(editor.visual_mode(), VisualMode::Character);
         assert_eq!(editor.selected_text().as_deref(), Some("select\nsecond"));
     }
@@ -948,9 +982,68 @@ mod tests {
     }
 
     #[test]
-    fn normal_escape_requests_close() {
+    fn normal_escape_stays_in_normal_mode() {
         let mut editor = VimEditor::new("select");
-        assert_eq!(editor.handle_key(key(KeyCode::Esc)), EditorCommand::Close);
+        assert_eq!(editor.handle_key(key(KeyCode::Esc)), EditorCommand::None);
+        assert_eq!(editor.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn normal_q_requests_close() {
+        let mut editor = VimEditor::new("select");
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char('q'))),
+            EditorCommand::Close
+        );
+    }
+
+    #[test]
+    fn normal_p_requests_clipboard_when_register_is_empty() {
+        let mut editor = VimEditor::new("select");
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char('p'))),
+            EditorCommand::PasteFromClipboard
+        );
+
+        let mut editor = VimEditor::new("select");
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char('P'))),
+            EditorCommand::PasteFromClipboard
+        );
+    }
+
+    #[test]
+    fn visual_q_requests_close_and_cancels_selection() {
+        let mut editor = VimEditor::new("select");
+        editor.handle_key(key(KeyCode::Char('v')));
+
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char('q'))),
+            EditorCommand::Close
+        );
+        assert!(!editor.has_visual_selection());
+        assert_eq!(editor.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn insert_escape_returns_to_normal_without_closing() {
+        let mut editor = VimEditor::new("select");
+        editor.handle_key(key(KeyCode::Char('i')));
+
+        assert_eq!(editor.handle_key(key(KeyCode::Esc)), EditorCommand::None);
+        assert_eq!(editor.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn restore_state_restores_cursor_scroll_and_dirty_state() {
+        let mut editor = VimEditor::new("first\nsecond");
+
+        editor.restore_state((1, 3), (4, 5), true);
+
+        assert_eq!(editor.cursor_position(), (1, 3));
+        assert_eq!(editor.scroll, (4, 5));
+        assert!(editor.is_dirty());
+        assert_eq!(editor.mode, VimMode::Normal);
     }
 
     #[test]

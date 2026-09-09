@@ -6,6 +6,26 @@ use serde::{Deserialize, Serialize};
 use crate::db::models::{DbObject, ObjectKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TabEditorState {
+    #[serde(default)]
+    pub cursor: (usize, usize),
+    #[serde(default)]
+    pub scroll: (u16, u16),
+    #[serde(default)]
+    pub dirty: bool,
+}
+
+impl Default for TabEditorState {
+    fn default() -> Self {
+        Self {
+            cursor: (0, 0),
+            scroll: (0, 0),
+            dirty: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tab {
     pub id: u64,
     pub database: String,
@@ -14,6 +34,10 @@ pub struct Tab {
     pub kind: TabKind,
     #[serde(default)]
     pub editor_text: Option<String>,
+    #[serde(default)]
+    pub editor_base_text: Option<String>,
+    #[serde(default)]
+    pub editor_state: TabEditorState,
     #[serde(default)]
     pub table_filter: String,
     #[serde(default)]
@@ -70,6 +94,8 @@ impl Tab {
             name: object.name.clone(),
             kind: TabKind::from_object_kind(object.kind),
             editor_text: None,
+            editor_base_text: None,
+            editor_state: TabEditorState::default(),
             table_filter: String::new(),
             table_sort: String::new(),
         }
@@ -104,7 +130,9 @@ impl Tab {
             owner: String::new(),
             name: format!("SQL #{}", id),
             kind: TabKind::Query,
+            editor_base_text: Some(text.clone()),
             editor_text: Some(text),
+            editor_state: TabEditorState::default(),
             table_filter: String::new(),
             table_sort: String::new(),
         }
@@ -142,6 +170,11 @@ impl TabsState {
             state.active = 0;
         } else {
             state.active = state.active.min(state.tabs.len() - 1);
+        }
+        for tab in &mut state.tabs {
+            if tab.editor_base_text.is_none() {
+                tab.editor_base_text = tab.editor_text.clone();
+            }
         }
         let max_id = state.tabs.iter().map(|t| t.id).max().unwrap_or(0);
         state.next_id = state.next_id.max(max_id + 1);
@@ -259,7 +292,7 @@ fn tabs_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TabKind, TabsState};
+    use super::{TabEditorState, TabKind, TabsState};
     use crate::db::models::{DbObject, ObjectKind};
 
     fn obj(owner: &str, name: &str, kind: ObjectKind) -> DbObject {
@@ -303,5 +336,29 @@ mod tests {
         let raw = toml::to_string(&s).unwrap();
         let restored: TabsState = toml::from_str(&raw).unwrap();
         assert_eq!(restored.tabs[0].kind, TabKind::View);
+    }
+
+    #[test]
+    fn query_tab_persists_editor_state_and_base_text() {
+        let mut s = TabsState::default();
+        let id = s.push_query("db".to_owned(), "select 1".to_owned());
+        s.tabs[0].editor_base_text = Some("select 1".to_owned());
+        s.tabs[0].editor_state = TabEditorState {
+            cursor: (2, 4),
+            scroll: (1, 3),
+            dirty: true,
+        };
+
+        let raw = toml::to_string(&s).unwrap();
+        let restored: TabsState = toml::from_str(&raw).unwrap();
+
+        assert_eq!(restored.tabs[0].id, id);
+        assert_eq!(
+            restored.tabs[0].editor_base_text.as_deref(),
+            Some("select 1")
+        );
+        assert_eq!(restored.tabs[0].editor_state.cursor, (2, 4));
+        assert_eq!(restored.tabs[0].editor_state.scroll, (1, 3));
+        assert!(restored.tabs[0].editor_state.dirty);
     }
 }

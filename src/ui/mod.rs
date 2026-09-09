@@ -15,7 +15,7 @@ pub mod syntax;
 use crate::{
     app::{App, AppMode, Focus, TableCopyStage},
     db::models::ObjectKind,
-    editor::SelectionRange,
+    editor::{SelectionRange, VimMode},
 };
 
 pub use syntax::highlight_sql;
@@ -126,7 +126,7 @@ fn render_tabs_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(tabs, rows[0]);
 
     let help = Paragraph::new(
-        " : SQL libre · Ctrl+Tab siguiente · Ctrl+w cerrar · Ctrl+Enter ejecuta selección",
+        " : SQL libre · Ctrl+Tab siguiente · Ctrl+w cerrar tab · q navegador · Ctrl+Enter selección",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(
@@ -1121,25 +1121,47 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(vertical[0]);
 
-    if let Some(session) = app.editor.as_mut() {
-        let cursor = session.editor.textarea.cursor();
-        let (cursor_row, cursor_col) = (cursor.0, cursor.1);
-        let title = format!(
-            " {} · {} · {}:{} {}",
-            session.title,
-            session.editor.mode,
-            cursor_row + 1,
-            cursor_col + 1,
-            if session.editor.is_dirty() { "[+]" } else { "" }
-        );
-        let block = panel_block(title, true);
-        let inner = block.inner(editor_layout[0]);
-        frame.render_widget(block, editor_layout[0]);
+    if app.editor.is_some() {
+        let (inner, cursor_row, cursor_col, scroll, content, selection, orig_lines) = {
+            let session = app.editor.as_mut().expect("editor checked above");
+            let cursor = session.editor.textarea.cursor();
+            let (cursor_row, cursor_col) = (cursor.0, cursor.1);
+            let mode = session.editor.mode;
+            let mode_style = match mode {
+                VimMode::Normal => Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+                VimMode::Insert => Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            };
+            let title = Line::from(vec![
+                Span::raw(format!(" {} · ", session.title)),
+                Span::styled(format!(" {} ", mode), mode_style),
+                Span::raw(format!(
+                    " · {}:{} {}",
+                    cursor_row + 1,
+                    cursor_col + 1,
+                    if session.editor.is_dirty() { "[+]" } else { "" }
+                )),
+            ]);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(title)
+                .border_style(
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD),
+                );
+            let inner = block.inner(editor_layout[0]);
+            frame.render_widget(block, editor_layout[0]);
 
-        if inner.width > 0 && inner.height > 0 {
-            let height = inner.height as usize;
-            let width = inner.width as usize;
-            {
+            if inner.width > 0 && inner.height > 0 {
+                let height = inner.height as usize;
+                let width = inner.width as usize;
                 let scroll = &mut session.editor.scroll;
                 let r = cursor_row as u16;
                 if r < scroll.0 {
@@ -1154,15 +1176,36 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     scroll.1 = c - width as u16 + 1;
                 }
             }
-            let scroll = session.editor.scroll;
-            let content = session.editor.text();
-            let base = crate::ui::syntax::highlight_sql(&content);
+
             let selection = session.editor.selection_for_render();
-            let orig_lines: Vec<String> = session.editor.textarea.lines().iter().cloned().collect();
-            let highlighted = apply_editor_selection(base, &orig_lines, selection);
-            let paragraph = Paragraph::new(highlighted)
-                .wrap(Wrap { trim: false })
-                .scroll(scroll);
+            let orig_lines = selection.map(|_| {
+                session
+                    .editor
+                    .textarea
+                    .lines()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            (
+                inner,
+                cursor_row,
+                cursor_col,
+                session.editor.scroll,
+                session.editor.text(),
+                selection,
+                orig_lines,
+            )
+        };
+
+        if inner.width > 0 && inner.height > 0 {
+            let base = app.highlighted_editor_text(&content);
+            let highlighted = if let Some(selection) = selection {
+                apply_editor_selection(base, orig_lines.as_deref().unwrap_or(&[]), Some(selection))
+            } else {
+                base
+            };
+            let paragraph = Paragraph::new(highlighted).scroll(scroll);
             frame.render_widget(paragraph, inner);
             let cursor_x = inner
                 .x
@@ -1599,7 +1642,8 @@ fn render_help(frame: &mut Frame<'_>) {
         "  /             búsqueda global             ? ayuda · q salir",
         "",
         "EDITOR NVIM-LIKE",
-        "  i/a/A/I       insertar            Esc        NORMAL / cerrar",
+        "  i/a/A/I       insertar            Esc        volver a NORMAL",
+        "  q             volver al navegador  Ctrl+w     cerrar tab",
         "  h/j/k/l       mover               w/b        palabra siguiente/anterior",
         "  0/$           inicio/fin línea    gg/G       inicio/fin archivo",
         "  o/O           línea debajo/arriba x          borrar carácter",

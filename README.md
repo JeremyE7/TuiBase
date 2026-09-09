@@ -20,7 +20,7 @@ TUI extensible en Rust para administrar **SAP/Sybase ASE** mediante `isql` y T-S
 - Lectura de definiciones desde `syscomments`.
 - Vista informativa del esquema de tablas desde `syscolumns` y `systypes`.
 - Preview de hasta 100 registros.
-- Editor modal nvim-like con NORMAL, INSERT y VISUAL.
+- Editor modal nvim-like con NORMAL e INSERT; la selección visual es transitoria.
 - Conversión automática de `CREATE PROCEDURE/FUNCTION/VIEW` a `CREATE OR REPLACE` al editar.
 - Panel inferior con el resultado de ASE mientras el editor permanece abierto.
 - Perfil de conexión `RO` o `RW`.
@@ -140,7 +140,8 @@ cargo build --release
 | Tecla | Acción |
 |---|---|
 | `i`, `a`, `A`, `I` | Entrar a INSERT |
-| `Esc` | Volver a NORMAL; desde NORMAL solicita cerrar |
+| `Esc` | Volver a NORMAL sin cerrar |
+| `q` | Volver al navegador desde NORMAL |
 | `h`, `j`, `k`, `l` | Mover cursor |
 | `w`, `b` | Palabra siguiente / anterior |
 | `e` | Final de la palabra |
@@ -149,15 +150,17 @@ cargo build --release
 | `o`, `O` | Crear línea debajo / arriba |
 | `x`, `X` | Borrar carácter siguiente / anterior |
 | `d`, `c`, `y` + movimiento | Borrar, cambiar o copiar un rango |
-| `dd`, `cc`, `yy`, `p`, `P` | Operar sobre líneas y pegar después / antes |
-| `v`, `V`, `Ctrl+V` | VISUAL carácter / línea / bloque |
-| `y`, `d`, `c`, `Ctrl+C` en VISUAL | Copiar, borrar o cambiar la selección |
+| `dd`, `cc`, `yy`, `p`, `P` | Operar sobre líneas y pegar después / antes; `p/P` usa portapapeles si no hay registro |
+| `v`, `V`, `Ctrl+V` | Selección visual carácter / línea / bloque |
+| `y`, `d`, `c`, `Ctrl+C` en selección visual | Copiar, borrar o cambiar la selección |
 | `Ctrl+A` | Seleccionar todo el buffer |
 | `Ctrl+V` en INSERT | Pegar desde el portapapeles del sistema |
 | `u`, `Ctrl+r` | Deshacer / rehacer |
 | `Ctrl+l` | Insertar línea al final y entrar a INSERT |
 | `Ctrl+Enter` | Ejecutar solo la selección VISUAL |
 | `Ctrl+s` | Ejecutar consulta o guardar DDL |
+
+El encabezado del editor muestra el modo activo como `NORMAL` o `INSERT`.
 
 ## Seguridad de escritura
 
@@ -201,7 +204,7 @@ src/
 ├── worker.rs               ejecución de BD fuera del hilo de UI
 ├── editor/
 │   ├── mod.rs
-│   └── vim.rs              NORMAL / INSERT / VISUAL
+│   └── vim.rs              NORMAL / INSERT / selección visual
 ├── ui/
 │   └── mod.rs              layout y overlays
 └── db/
