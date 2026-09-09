@@ -240,6 +240,12 @@ pub struct EditorCompletionSession {
     pub trigger_col: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EditorDatabasePickerSession {
+    pub(crate) invalid_database: String,
+    pub(crate) selected: usize,
+}
+
 struct EditorHighlightCache {
     source: String,
     highlighted: Text<'static>,
@@ -311,6 +317,7 @@ pub struct App {
     pub execution_error_modal: Option<String>,
     pub execution_error_scroll: u16,
     pub help_scroll: u16,
+    pub(crate) editor_database_picker: Option<EditorDatabasePickerSession>,
     search_return_mode: AppMode,
     help_return_mode: AppMode,
     search: Option<SearchSession>,
@@ -407,6 +414,7 @@ impl App {
             execution_error_modal: None,
             execution_error_scroll: 0,
             help_scroll: 0,
+            editor_database_picker: None,
             search_return_mode: AppMode::Browser,
             help_return_mode: AppMode::Browser,
             filter_session: None,
@@ -512,6 +520,10 @@ impl App {
 
     pub fn current_execution_error_modal(&self) -> Option<&str> {
         self.execution_error_modal.as_deref()
+    }
+
+    pub(crate) fn current_editor_database_picker(&self) -> Option<&EditorDatabasePickerSession> {
+        self.editor_database_picker.as_ref()
     }
 
     pub fn table_cell_draft_value(&self, row_index: usize, column: &str) -> Option<&str> {
@@ -821,37 +833,46 @@ impl App {
             self.status = "No hay una base seleccionada para la consulta".to_owned();
             return;
         };
+        if self.bind_editor_to_database(database.clone()) {
+            self.status = format!("Consulta asociada a la base {database}");
+        }
+    }
+
+    fn bind_editor_to_database(&mut self, database: String) -> bool {
         if !self
             .editor
             .as_ref()
             .is_some_and(|session| matches!(&session.purpose, EditorPurpose::Query))
         {
             self.status = "Ctrl+D solo reasigna consultas SQL libres".to_owned();
-            return;
+            return false;
         }
 
         self.persist_active_editor();
         let Some(tab) = self.tabs.tabs.get_mut(self.tabs.active) else {
             self.status = "No hay una pestaña de consulta SQL libre activa".to_owned();
-            return;
+            return false;
         };
         if tab.kind != crate::tabs::TabKind::Query {
             self.status = "La pestaña activa no es una consulta SQL libre".to_owned();
-            return;
+            return false;
         }
         tab.database = database.clone();
         let _ = self.tabs.save();
         if let Some(session) = self.editor.as_mut() {
             session.title = format!("Consulta T-SQL · {database}");
         }
-        self.status = format!("Consulta asociada a la base {database}");
+        true
+    }
+
+    fn editor_requested_database(&self, profile: &ConnectionProfile) -> String {
+        self.active_tab_database()
+            .or_else(|| self.active_database().map(ToOwned::to_owned))
+            .unwrap_or_else(|| profile.initial_database().to_owned())
     }
 
     fn editor_execution_database(&self, profile: &ConnectionProfile) -> Result<String, String> {
-        let database = self
-            .active_tab_database()
-            .or_else(|| self.active_database().map(ToOwned::to_owned))
-            .unwrap_or_else(|| profile.initial_database().to_owned());
+        let database = self.editor_requested_database(profile);
         if !self.databases.is_empty()
             && !self
                 .databases
@@ -1054,6 +1075,7 @@ impl App {
     }
 
     fn load_active_tab(&mut self) {
+        self.editor_database_picker = None;
         let Some(tab) = self.tabs.active().cloned() else {
             return;
         };
@@ -1226,8 +1248,124 @@ impl App {
         }
     }
 
+    fn open_editor_database_picker(&mut self, invalid_database: String) {
+        let Some(selected) =
+            (!self.databases.is_empty()).then(|| self.database_index.min(self.databases.len() - 1))
+        else {
+            self.status = format!(
+                "ERROR: la base '{invalid_database}' no está disponible y no hay bases cargadas"
+            );
+            return;
+        };
+
+        self.editor_completion = None;
+        self.editor_database_picker = Some(EditorDatabasePickerSession {
+            invalid_database: invalid_database.clone(),
+            selected,
+        });
+        self.status = format!(
+            "La base '{invalid_database}' no está disponible · selecciona una base y pulsa Enter"
+        );
+    }
+
+    fn handle_editor_database_picker_key(&mut self, key: KeyEvent) -> bool {
+        if self.editor_database_picker.is_none() {
+            return false;
+        }
+
+        let plain = key.modifiers.is_empty();
+        match key.code {
+            KeyCode::Esc => {
+                self.cancel_editor_database_picker();
+                true
+            }
+            KeyCode::Up if plain => {
+                self.move_editor_database_picker(-1);
+                true
+            }
+            KeyCode::Down if plain => {
+                self.move_editor_database_picker(1);
+                true
+            }
+            KeyCode::Char('k') if plain => {
+                self.move_editor_database_picker(-1);
+                true
+            }
+            KeyCode::Char('j') if plain => {
+                self.move_editor_database_picker(1);
+                true
+            }
+            KeyCode::Home if plain => {
+                self.move_editor_database_picker_to_start();
+                true
+            }
+            KeyCode::End if plain => {
+                self.move_editor_database_picker_to_end();
+                true
+            }
+            KeyCode::Enter => {
+                self.accept_editor_database_picker();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn move_editor_database_picker(&mut self, delta: isize) {
+        let Some(picker) = self.editor_database_picker.as_mut() else {
+            return;
+        };
+        picker.selected = shifted_index(picker.selected, self.databases.len(), delta);
+    }
+
+    fn move_editor_database_picker_to_start(&mut self) {
+        if let Some(picker) = self.editor_database_picker.as_mut() {
+            picker.selected = 0;
+        }
+    }
+
+    fn move_editor_database_picker_to_end(&mut self) {
+        if let Some(picker) = self.editor_database_picker.as_mut() {
+            picker.selected = self.databases.len().saturating_sub(1);
+        }
+    }
+
+    fn cancel_editor_database_picker(&mut self) {
+        let Some(picker) = self.editor_database_picker.take() else {
+            return;
+        };
+        self.status = format!(
+            "Selección cancelada · la consulta sigue asociada a {}",
+            picker.invalid_database
+        );
+    }
+
+    fn accept_editor_database_picker(&mut self) {
+        let Some(selected) = self
+            .editor_database_picker
+            .as_ref()
+            .map(|picker| picker.selected)
+        else {
+            return;
+        };
+        let Some(database) = self.databases.get(selected).cloned() else {
+            self.editor_database_picker = None;
+            self.status = "ERROR: no hay una base válida para asociar".to_owned();
+            return;
+        };
+
+        self.database_index = selected;
+        self.editor_database_picker = None;
+        if self.bind_editor_to_database(database.clone()) {
+            self.status = format!("Consulta asociada a la base {database} · Ctrl+S para ejecutar");
+        }
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.handle_editor_database_picker_key(key) {
+            return;
+        }
         if self.console_focus == ConsoleFocus::Results {
             self.handle_console_key(key);
             return;
@@ -1288,20 +1426,15 @@ impl App {
                     }
                 }
             }
-            EditorCommand::PasteFromClipboard => match services::clipboard::read_text() {
-                Ok(text) => {
-                    if let Some(session) = self.editor.as_mut() {
-                        session.editor.paste_external_text(&text);
-                        self.status = format!(
-                            "Pegado desde portapapeles · {} líneas",
-                            text.lines().count()
-                        );
-                    }
+            EditorCommand::PasteFromClipboard { before } => {
+                match services::clipboard::read_text() {
+                    Ok(text) => self.paste_editor_clipboard_text(text, before),
+                    Err(error) => self.status = format!("ERROR al leer portapapeles: {error}"),
                 }
-                Err(error) => {
-                    self.status = format!("ERROR al leer portapapeles: {error}");
-                }
-            },
+            }
+            EditorCommand::PasteFromClipboardOrRegister { before } => {
+                self.paste_editor_clipboard_first(before)
+            }
             EditorCommand::Close => {
                 let dirty = self
                     .editor
@@ -1320,6 +1453,41 @@ impl App {
                 }
             }
         }
+    }
+
+    fn paste_editor_clipboard_text(&mut self, text: String, before: bool) {
+        if text.is_empty() {
+            self.status = "ERROR: el portapapeles está vacío".to_owned();
+            return;
+        }
+        let line_count = text.lines().count();
+        if let Some(session) = self.editor.as_mut() {
+            session.editor.paste_external_text(&text, before);
+            self.status = format!("Pegado desde portapapeles · {line_count} líneas");
+        }
+    }
+
+    fn paste_editor_clipboard_first(&mut self, before: bool) {
+        match services::clipboard::read_text() {
+            Ok(text) if !text.is_empty() => self.paste_editor_clipboard_text(text, before),
+            Ok(_) => self.paste_editor_internal_register(before, "el portapapeles está vacío"),
+            Err(error) => self.paste_editor_internal_register(
+                before,
+                &format!("no se pudo leer el portapapeles: {error}"),
+            ),
+        }
+    }
+
+    fn paste_editor_internal_register(&mut self, before: bool, reason: &str) {
+        let pasted = self
+            .editor
+            .as_mut()
+            .is_some_and(|session| session.editor.paste_internal_register(before));
+        self.status = if pasted {
+            format!("Pegado desde buffer interno · {reason}")
+        } else {
+            format!("ERROR: {reason} y el buffer interno está vacío")
+        };
     }
 
     fn execute_selected_editor(&mut self) {
@@ -4445,11 +4613,20 @@ impl App {
             return;
         };
         let connection_index = self.connection_index;
+        let requested_database = self.editor_requested_database(&profile);
         let database = match self.editor_execution_database(&profile) {
             Ok(database) => database,
             Err(error) => {
                 self.return_to_editor_after_execution = false;
-                self.status = format!("ERROR: {error}");
+                let is_query = self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|session| matches!(&session.purpose, EditorPurpose::Query));
+                if is_query {
+                    self.open_editor_database_picker(requested_database);
+                } else {
+                    self.status = format!("ERROR: {error}");
+                }
                 self.mode = AppMode::Editor;
                 return;
             }
@@ -6448,6 +6625,57 @@ mod tests {
 
         assert!(error.contains("reporting"));
         assert!(error.contains("Ctrl+D"));
+    }
+
+    fn stale_query_editor_app() -> App {
+        let mut app = editor_test_app();
+        app.databases = vec!["meg_servicios".to_owned(), "master".to_owned()];
+        app.database_index = 0;
+        app.tabs = TabsState::default();
+        app.tabs
+            .push_query("reporting".to_owned(), "select 1".to_owned());
+        app.editor = Some(EditorSession {
+            title: "Consulta T-SQL · reporting".to_owned(),
+            purpose: EditorPurpose::Query,
+            editor: VimEditor::new("select 1"),
+        });
+        app.mode = AppMode::Editor;
+        app
+    }
+
+    #[test]
+    fn unavailable_query_database_opens_explicit_picker() {
+        let mut app = stale_query_editor_app();
+
+        app.dispatch_execute("select 1".to_owned());
+
+        let picker = app.current_editor_database_picker().unwrap();
+        assert_eq!(picker.invalid_database, "reporting");
+        assert_eq!(picker.selected, 0);
+        assert_eq!(app.mode, AppMode::Editor);
+        assert!(app.pending_requests.is_empty());
+        assert!(app.status.contains("selecciona una base"));
+    }
+
+    #[test]
+    fn database_picker_navigates_and_escape_preserves_stale_association() {
+        let mut app = stale_query_editor_app();
+        app.dispatch_execute("select 1".to_owned());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.current_editor_database_picker().unwrap().selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.current_editor_database_picker().unwrap().selected, 0);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.current_editor_database_picker().unwrap().selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.current_editor_database_picker().unwrap().selected, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.current_editor_database_picker().is_none());
+        assert_eq!(app.tabs.active().unwrap().database, "reporting");
+        assert!(app.status.contains("sigue asociada"));
     }
 
     #[test]

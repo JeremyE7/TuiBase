@@ -211,7 +211,7 @@ Los modales de valor, metadata, resumen, vista previa y error usan `j/k`, `PgUp/
 | `d` / `c` / `y` + movimiento | Borrar/cambiar/copiar rango |
 | `dd` / `cc` / `yy` | Operar sobre líneas completas |
 | `Y` | Copiar líneas completas |
-| `p` / `P` | Pegar después/antes; usa clipboard como fallback |
+| `p` / `P` | Priorizar portapapeles del sistema; buffer interno como fallback |
 | `u` / `Ctrl+r` | Deshacer/rehacer |
 | `v` / `V` / `Ctrl+v` | Visual carácter/línea/bloque |
 | `J` | Unir línea con la siguiente |
@@ -224,6 +224,8 @@ Los modales de valor, metadata, resumen, vista previa y error usan `j/k`, `PgUp/
 | `c` en VISUAL | Cambiar selección e insertar |
 | `I` / `A` en VISUAL por bloques | Insertar al inicio/final de cada línea |
 | `1..9` | Prefijo de cantidad para movimientos/operaciones |
+
+Si una consulta libre guardada apunta a una base que ya no está disponible, al ejecutarla se abre un selector con las bases cargadas. Usa `j/k`, las flechas o `Home/End`, confirma con `Enter` y luego pulsa `Ctrl+s` para ejecutar. `Esc` cancela sin cambiar la asociación.
 
 ### Consola de resultados SQL
 

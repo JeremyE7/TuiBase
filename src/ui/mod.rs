@@ -75,8 +75,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_table_copy_overlay(frame, app);
     }
 
-    if app.mode == AppMode::Editor && app.editor_completion.is_some() {
-        render_editor_completion(frame, app);
+    if app.mode == AppMode::Editor {
+        if app.current_editor_database_picker().is_some() {
+            render_editor_database_picker(frame, app);
+        } else if app.editor_completion.is_some() {
+            render_editor_completion(frame, app);
+        }
     }
 
     if app.mode == AppMode::Table && app.current_execution_error_modal().is_some() {
@@ -1584,6 +1588,54 @@ fn render_editor_completion(frame: &mut Frame<'_>, app: &App) {
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
+fn render_editor_database_picker(frame: &mut Frame<'_>, app: &App) {
+    let Some(picker) = app.current_editor_database_picker() else {
+        return;
+    };
+    let area = centered_rect(68, 58, frame.area());
+    frame.render_widget(Clear, area);
+
+    let outer = panel_block(
+        " Base de consulta · Enter asocia · Ctrl+S ejecuta · Esc cancela ",
+        true,
+    );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(3)])
+        .split(inner);
+    let message = Paragraph::new(vec![
+        Line::from("La consulta guardada apunta a una base no disponible:"),
+        Line::from(Span::styled(
+            picker.invalid_database.as_str(),
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("Elige una base válida. La consulta no se ejecutará todavía."),
+    ])
+    .block(panel_block(" Selección requerida ", false))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(message, sections[0]);
+
+    let items = app
+        .databases
+        .iter()
+        .map(|database| ListItem::new(database.clone()))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(picker.selected.min(items.len() - 1)));
+    }
+    let databases = List::new(items)
+        .block(panel_block(" Bases disponibles · j/k o ↑/↓ ", false))
+        .highlight_symbol("▸ ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
+    frame.render_stateful_widget(databases, sections[1], &mut state);
+}
+
 fn render_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1833,7 +1885,7 @@ fn render_help(frame: &mut Frame<'_>, app: &App) {
         "  d/c/y + movimiento      borrar / cambiar / copiar un rango",
         "  dd/cc/yy                operar sobre líneas completas",
         "  Y                       copiar líneas completas",
-        "  p/P                     pegar después / antes; usa clipboard como fallback",
+        "  p/P                     portapapeles primero; buffer interno como fallback",
         "  u / Ctrl+r              deshacer / rehacer",
         "  v / V / Ctrl+v          visual carácter / línea / bloque",
         "  J                       unir línea con la siguiente",

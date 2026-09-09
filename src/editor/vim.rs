@@ -31,7 +31,8 @@ pub enum EditorCommand {
     Save,
     ExecuteSelection,
     CopyToClipboard(String),
-    PasteFromClipboard,
+    PasteFromClipboard { before: bool },
+    PasteFromClipboardOrRegister { before: bool },
     Close,
 }
 
@@ -113,16 +114,34 @@ impl VimEditor {
         self.visual_anchor.is_some()
     }
 
-    pub fn paste_external_text(&mut self, text: &str) {
+    pub fn paste_external_text(&mut self, text: &str, before: bool) {
+        if text.is_empty() {
+            return;
+        }
         if self.mode == VimMode::Insert {
-            if self.textarea.insert_str(text) {
-                self.dirty = true;
-            }
+            let (row, column) = self.cursor_position();
+            self.insert_external_text_at(row, column, text);
+            self.dirty = true;
         } else {
             self.with_change(|editor| {
-                editor.textarea.insert_str(text);
+                let (row, cursor_column) = editor.cursor_position();
+                let line_length = char_len(&editor.textarea.lines()[row]);
+                let column = if before {
+                    cursor_column
+                } else {
+                    (cursor_column + 1).min(line_length)
+                };
+                editor.insert_external_text_at(row, column, text);
             });
         }
+    }
+
+    pub fn paste_internal_register(&mut self, before: bool) -> bool {
+        let Some(register) = self.registers.unnamed().cloned() else {
+            return false;
+        };
+        self.with_change(|editor| editor.insert_register(&register, before));
+        true
     }
 
     pub fn visual_mode(&self) -> VisualMode {
@@ -169,7 +188,7 @@ impl VimEditor {
         }
         if ctrl && key.code == KeyCode::Char('v') {
             if self.mode == VimMode::Insert {
-                return EditorCommand::PasteFromClipboard;
+                return EditorCommand::PasteFromClipboard { before: false };
             }
             if self.has_visual_selection() {
                 self.visual_mode = if self.visual_mode == VisualMode::Block {
@@ -565,11 +584,35 @@ impl VimEditor {
     }
 
     fn paste(&mut self, before: bool) -> EditorCommand {
-        let Some(register) = self.registers.unnamed().cloned() else {
-            return EditorCommand::PasteFromClipboard;
+        EditorCommand::PasteFromClipboardOrRegister { before }
+    }
+
+    fn insert_external_text_at(&mut self, row: usize, column: usize, text: &str) {
+        let mut lines = self.textarea.lines().to_vec();
+        let row = row.min(lines.len().saturating_sub(1));
+        let column = column.min(char_len(&lines[row]));
+        let byte = super::buffer::char_to_byte(&lines[row], column);
+        let line = lines[row].clone();
+        let prefix = line[..byte].to_owned();
+        let suffix = line[byte..].to_owned();
+        let additions = split_text(text);
+        let last = additions.len().saturating_sub(1);
+        let mut replacement = Vec::with_capacity(additions.len());
+        replacement.push(format!("{prefix}{}", additions[0]));
+        if last > 0 {
+            replacement.extend(additions[1..last].iter().cloned());
+            replacement.push(format!("{}{suffix}", additions[last]));
+        } else {
+            replacement[0].push_str(&suffix);
+        }
+
+        let cursor = if last == 0 {
+            (row, column + additions[0].chars().count())
+        } else {
+            (row + last, additions[last].chars().count())
         };
-        self.with_change(|editor| editor.insert_register(&register, before));
-        EditorCommand::None
+        lines.splice(row..=row, replacement);
+        self.replace_lines(lines, cursor);
     }
 
     fn insert_register(&mut self, register: &RegisterValue, before: bool) {
@@ -1002,14 +1045,51 @@ mod tests {
         let mut editor = VimEditor::new("select");
         assert_eq!(
             editor.handle_key(key(KeyCode::Char('p'))),
-            EditorCommand::PasteFromClipboard
+            EditorCommand::PasteFromClipboardOrRegister { before: false }
         );
 
         let mut editor = VimEditor::new("select");
         assert_eq!(
             editor.handle_key(key(KeyCode::Char('P'))),
-            EditorCommand::PasteFromClipboard
+            EditorCommand::PasteFromClipboardOrRegister { before: true }
         );
+    }
+
+    #[test]
+    fn normal_p_prefers_clipboard_even_when_register_has_text() {
+        let mut editor = VimEditor::new("select");
+        editor.handle_key(key(KeyCode::Char('v')));
+        editor.handle_key(key(KeyCode::Char('y')));
+
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char('p'))),
+            EditorCommand::PasteFromClipboardOrRegister { before: false }
+        );
+        assert_eq!(
+            editor.handle_key(key(KeyCode::Char('P'))),
+            EditorCommand::PasteFromClipboardOrRegister { before: true }
+        );
+    }
+
+    #[test]
+    fn external_paste_preserves_leading_text_and_normalizes_line_endings() {
+        let mut before = VimEditor::new("X");
+        before.paste_external_text("first\r\nsecond", true);
+        assert_eq!(before.text(), "first\nsecondX");
+
+        let mut after = VimEditor::new("X");
+        after.paste_external_text("first\r\nsecond", false);
+        assert_eq!(after.text(), "Xfirst\nsecond");
+    }
+
+    #[test]
+    fn external_insert_paste_preserves_leading_text() {
+        let mut editor = VimEditor::new("X");
+        editor.handle_key(key(KeyCode::Char('i')));
+        editor.paste_external_text("first\r\nsecond", false);
+
+        assert_eq!(editor.text(), "first\nsecondX");
+        assert!(editor.is_dirty());
     }
 
     #[test]
