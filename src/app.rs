@@ -207,6 +207,22 @@ pub struct EditorSession {
     pub editor: VimEditor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsoleFocus {
+    Editor,
+    Results,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConsoleResult {
+    pub(crate) database: String,
+    pub(crate) output: SqlOutput,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) scroll: u16,
+    pub(crate) selected_row: usize,
+    pub(crate) selected_column: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionItem {
     pub label: String,
@@ -257,6 +273,9 @@ pub struct App {
     pub console_elapsed_ms: Option<u64>,
     pub console_success: Option<bool>,
     pub sql_result: Option<TablePreview>,
+    pub(crate) console_results: Vec<ConsoleResult>,
+    pub(crate) console_result_index: usize,
+    pub(crate) console_focus: ConsoleFocus,
     pub status: String,
     pub last_key: String,
     pub editor: Option<EditorSession>,
@@ -291,6 +310,7 @@ pub struct App {
     pub table_sql_preview_scroll: u16,
     pub execution_error_modal: Option<String>,
     pub execution_error_scroll: u16,
+    pub help_scroll: u16,
     search_return_mode: AppMode,
     help_return_mode: AppMode,
     search: Option<SearchSession>,
@@ -353,6 +373,9 @@ impl App {
             console_elapsed_ms: None,
             console_success: None,
             sql_result: None,
+            console_results: Vec::new(),
+            console_result_index: 0,
+            console_focus: ConsoleFocus::Editor,
             status: "Listo".to_owned(),
             table_page: None,
             table_metadata: None,
@@ -383,6 +406,7 @@ impl App {
             table_sql_preview_scroll: 0,
             execution_error_modal: None,
             execution_error_scroll: 0,
+            help_scroll: 0,
             search_return_mode: AppMode::Browser,
             help_return_mode: AppMode::Browser,
             filter_session: None,
@@ -432,6 +456,22 @@ impl App {
 
     pub fn current_database(&self) -> Option<&str> {
         self.databases.get(self.database_index).map(String::as_str)
+    }
+
+    pub(crate) fn console_results(&self) -> &[ConsoleResult] {
+        &self.console_results
+    }
+
+    pub(crate) fn active_console_result(&self) -> Option<&ConsoleResult> {
+        self.console_results.get(self.console_result_index)
+    }
+
+    pub(crate) fn console_result_index(&self) -> usize {
+        self.console_result_index
+    }
+
+    pub(crate) fn console_is_focused(&self) -> bool {
+        self.console_focus == ConsoleFocus::Results
     }
 
     pub fn current_search_session(&self) -> Option<&SearchSession> {
@@ -548,6 +588,283 @@ impl App {
         highlighted
     }
 
+    fn clear_console_results(&mut self) {
+        self.console_results.clear();
+        self.console_result_index = 0;
+        self.console_focus = ConsoleFocus::Editor;
+        self.sync_active_console_result();
+        self.content_title = "Consola de resultados".to_owned();
+    }
+
+    fn append_console_result(&mut self, database: String, mut output: SqlOutput, elapsed_ms: u64) {
+        let elapsed_ms = output.elapsed_ms.max(elapsed_ms);
+        output.elapsed_ms = elapsed_ms;
+        self.console_results.push(ConsoleResult {
+            database,
+            output,
+            elapsed_ms,
+            scroll: 0,
+            selected_row: 0,
+            selected_column: 0,
+        });
+        self.console_result_index = self.console_results.len().saturating_sub(1);
+        self.sync_active_console_result();
+    }
+
+    fn sync_active_console_result(&mut self) {
+        let Some(result) = self.active_console_result() else {
+            self.console_elapsed_ms = None;
+            self.console_success = None;
+            self.sql_result = None;
+            self.content.clear();
+            self.content_scroll = 0;
+            return;
+        };
+
+        let (elapsed_ms, success, table, content, scroll, title) = (
+            result.elapsed_ms,
+            result.output.success,
+            result
+                .output
+                .table
+                .clone()
+                .filter(|_| result.output.success),
+            result.output.combined(),
+            result.scroll,
+            console_result_title(result),
+        );
+        self.console_elapsed_ms = Some(elapsed_ms);
+        self.console_success = Some(success);
+        self.sql_result = table;
+        self.content = content;
+        self.content_scroll = scroll;
+        self.content_title = title;
+    }
+
+    fn switch_console_result(&mut self, delta: isize) {
+        if self.console_results.is_empty() {
+            self.status = "No hay resultados en la consola".to_owned();
+            return;
+        }
+        self.console_result_index =
+            shifted_index(self.console_result_index, self.console_results.len(), delta);
+        self.sync_active_console_result();
+        self.status = format!(
+            "Resultado {}/{}",
+            self.console_result_index + 1,
+            self.console_results.len()
+        );
+    }
+
+    fn move_console_vertical(&mut self, delta: isize) {
+        let Some(result) = self.console_results.get_mut(self.console_result_index) else {
+            return;
+        };
+        if let Some(table) = result
+            .output
+            .table
+            .as_ref()
+            .filter(|_| result.output.success)
+        {
+            if !table.rows.is_empty() {
+                result.selected_row = shifted_index(result.selected_row, table.rows.len(), delta);
+            }
+        } else if delta < 0 {
+            result.scroll = result.scroll.saturating_sub(delta.unsigned_abs() as u16);
+        } else {
+            result.scroll = result.scroll.saturating_add(delta as u16);
+        }
+        self.sync_active_console_result();
+    }
+
+    fn move_console_horizontal(&mut self, delta: isize) {
+        let Some(result) = self.console_results.get_mut(self.console_result_index) else {
+            return;
+        };
+        let Some(table) = result
+            .output
+            .table
+            .as_ref()
+            .filter(|_| result.output.success)
+        else {
+            return;
+        };
+        if !table.columns.is_empty() {
+            result.selected_column =
+                shifted_index(result.selected_column, table.columns.len(), delta);
+        }
+    }
+
+    fn set_console_end(&mut self) {
+        let Some(result) = self.console_results.get_mut(self.console_result_index) else {
+            return;
+        };
+        if let Some(table) = result
+            .output
+            .table
+            .as_ref()
+            .filter(|_| result.output.success)
+        {
+            result.selected_row = table.rows.len().saturating_sub(1);
+        } else {
+            result.scroll = u16::MAX;
+        }
+        self.sync_active_console_result();
+    }
+
+    fn copy_console_line(&mut self) {
+        let Some(result) = self.active_console_result().cloned() else {
+            self.status = "No hay resultados para copiar".to_owned();
+            return;
+        };
+        let text = console_result_line(&result);
+        if text.is_empty() {
+            self.status = "La línea seleccionada está vacía".to_owned();
+            return;
+        }
+        self.status = match services::clipboard::copy_text(&text) {
+            Ok(()) => "Línea/fila copiada al portapapeles".to_owned(),
+            Err(error) => format!("ERROR al copiar resultado: {error}"),
+        };
+    }
+
+    fn copy_console_result(&mut self) {
+        let Some(result) = self.active_console_result().cloned() else {
+            self.status = "No hay resultados para copiar".to_owned();
+            return;
+        };
+        let text = console_result_text(&result);
+        if text.is_empty() {
+            self.status = "El resultado está vacío".to_owned();
+            return;
+        }
+        let line_count = text.lines().count();
+        self.status = match services::clipboard::copy_text(&text) {
+            Ok(()) => format!("Resultado copiado al portapapeles · {line_count} líneas"),
+            Err(error) => format!("ERROR al copiar resultado: {error}"),
+        };
+    }
+
+    fn clear_active_console_result(&mut self) {
+        if self.console_results.is_empty() {
+            self.status = "No hay resultados para limpiar".to_owned();
+            return;
+        }
+        self.console_results.remove(self.console_result_index);
+        self.console_result_index = self
+            .console_result_index
+            .min(self.console_results.len().saturating_sub(1));
+        self.sync_active_console_result();
+        if self.console_results.is_empty() {
+            self.content_title = "Consola de resultados".to_owned();
+        }
+        self.status = "Resultado limpiado".to_owned();
+    }
+
+    fn handle_console_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('j')) {
+            self.console_focus = ConsoleFocus::Editor;
+            self.status = "Editor enfocado · Ctrl+J vuelve a resultados".to_owned();
+            return;
+        }
+        if ctrl && key.code == KeyCode::PageUp {
+            self.switch_console_result(-1);
+            return;
+        }
+        if ctrl && key.code == KeyCode::PageDown {
+            self.switch_console_result(1);
+            return;
+        }
+        if ctrl && shift && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L')) {
+            self.clear_console_results();
+            self.console_focus = ConsoleFocus::Results;
+            self.status = "Todos los resultados fueron limpiados".to_owned();
+            return;
+        }
+        if ctrl && !shift && key.code == KeyCode::Char('l') {
+            self.clear_active_console_result();
+            return;
+        }
+        if key.code == KeyCode::Char('Y') && !ctrl && !key.modifiers.contains(KeyModifiers::ALT) {
+            self.copy_console_result();
+            return;
+        }
+        if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+            self.copy_console_line();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.move_console_vertical(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_console_vertical(1),
+            KeyCode::PageUp => self.move_console_vertical(-8),
+            KeyCode::PageDown => self.move_console_vertical(8),
+            KeyCode::Left | KeyCode::Char('h') => self.move_console_horizontal(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.move_console_horizontal(1),
+            KeyCode::Home | KeyCode::Char('g') => {
+                if let Some(result) = self.console_results.get_mut(self.console_result_index) {
+                    result.scroll = 0;
+                    result.selected_row = 0;
+                    result.selected_column = 0;
+                }
+                self.sync_active_console_result();
+            }
+            KeyCode::End | KeyCode::Char('G') => self.set_console_end(),
+            _ => {}
+        }
+    }
+
+    fn bind_editor_to_current_database(&mut self) {
+        let Some(database) = self.active_database().map(ToOwned::to_owned) else {
+            self.status = "No hay una base seleccionada para la consulta".to_owned();
+            return;
+        };
+        if !self
+            .editor
+            .as_ref()
+            .is_some_and(|session| matches!(&session.purpose, EditorPurpose::Query))
+        {
+            self.status = "Ctrl+D solo reasigna consultas SQL libres".to_owned();
+            return;
+        }
+
+        self.persist_active_editor();
+        let Some(tab) = self.tabs.tabs.get_mut(self.tabs.active) else {
+            self.status = "No hay una pestaña de consulta SQL libre activa".to_owned();
+            return;
+        };
+        if tab.kind != crate::tabs::TabKind::Query {
+            self.status = "La pestaña activa no es una consulta SQL libre".to_owned();
+            return;
+        }
+        tab.database = database.clone();
+        let _ = self.tabs.save();
+        if let Some(session) = self.editor.as_mut() {
+            session.title = format!("Consulta T-SQL · {database}");
+        }
+        self.status = format!("Consulta asociada a la base {database}");
+    }
+
+    fn editor_execution_database(&self, profile: &ConnectionProfile) -> Result<String, String> {
+        let database = self
+            .active_tab_database()
+            .or_else(|| self.active_database().map(ToOwned::to_owned))
+            .unwrap_or_else(|| profile.initial_database().to_owned());
+        if !self.databases.is_empty()
+            && !self
+                .databases
+                .iter()
+                .any(|available| available.eq_ignore_ascii_case(&database))
+        {
+            return Err(format!(
+                "La base '{database}' no está disponible en esta conexión · selecciona una base válida y usa Ctrl+D"
+            ));
+        }
+        Ok(database)
+    }
+
     pub fn active_search_label(&self) -> Option<String> {
         self.active_search
             .as_ref()
@@ -565,6 +882,10 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.last_key = format_key(key);
+        if self.mode != AppMode::Help && is_help_key(key) {
+            self.open_help();
+            return;
+        }
         if self.handle_tab_key(key) {
             return;
         }
@@ -574,14 +895,7 @@ impl App {
             AppMode::Confirm => self.handle_confirm_key(key),
             AppMode::Table => self.handle_table_key(key),
             AppMode::Search => self.handle_search_key(key),
-            AppMode::Help => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
-                ) {
-                    self.mode = self.help_return_mode;
-                }
-            }
+            AppMode::Help => self.handle_help_key(key),
         }
     }
 
@@ -594,8 +908,15 @@ impl App {
                 .editor
                 .as_ref()
                 .is_some_and(|s| s.editor.mode == crate::editor::VimMode::Insert);
+        let in_console_results =
+            self.mode == AppMode::Editor && self.console_focus == ConsoleFocus::Results;
 
         if in_editor_insert {
+            return false;
+        }
+
+        if in_console_results && ctrl && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
+        {
             return false;
         }
 
@@ -874,10 +1195,56 @@ impl App {
 
     fn open_help(&mut self) {
         self.help_return_mode = self.mode;
+        self.help_scroll = 0;
         self.mode = AppMode::Help;
     }
 
+    fn handle_help_key(&mut self, key: KeyEvent) {
+        if key.modifiers.is_empty()
+            && matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
+            )
+        {
+            self.mode = self.help_return_mode;
+            self.help_scroll = 0;
+            return;
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(8),
+            KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(8),
+            KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.help_scroll = u16::MAX,
+            _ => {}
+        }
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.console_focus == ConsoleFocus::Results {
+            self.handle_console_key(key);
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('j') {
+            if self.console_results.is_empty() {
+                self.status = "No hay resultados en la consola".to_owned();
+            } else {
+                self.console_focus = ConsoleFocus::Results;
+                self.status = "Consola enfocada · Esc/Ctrl+J vuelve al editor".to_owned();
+            }
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('d') {
+            self.bind_editor_to_current_database();
+            return;
+        }
         if self.editor_completion.is_some() && self.handle_editor_completion_key(key) {
             return;
         }
@@ -3958,10 +4325,10 @@ impl App {
             purpose: EditorPurpose::TableValues(object),
             editor: VimEditor::new(sql),
         });
+        self.clear_console_results();
         self.content_title = "Resultado de ejecución".to_owned();
         self.content.clear();
         self.content_scroll = 0;
-        self.sql_result = None;
         self.mode = AppMode::Editor;
         self.status = "Editor NORMAL · i para insertar · Ctrl+S para ejecutar".to_owned();
     }
@@ -3990,10 +4357,10 @@ impl App {
             purpose: EditorPurpose::Query,
             editor,
         });
+        self.clear_console_results();
         self.content_title = "Resultado de ejecución".to_owned();
         self.content.clear();
         self.content_scroll = 0;
-        self.sql_result = None;
         self.mode = AppMode::Editor;
         self.status = "Editor NORMAL · i para insertar · Ctrl+S para ejecutar".to_owned();
     }
@@ -4017,10 +4384,10 @@ impl App {
             purpose: EditorPurpose::ObjectDefinition(object),
             editor,
         });
+        self.clear_console_results();
         self.content_title = "Resultado de ejecución".to_owned();
         self.content.clear();
         self.content_scroll = 0;
-        self.sql_result = None;
         self.mode = AppMode::Editor;
         self.status = "Editor NORMAL · Ctrl+S propone guardar · Esc cierra".to_owned();
     }
@@ -4078,10 +4445,15 @@ impl App {
             return;
         };
         let connection_index = self.connection_index;
-        let database = self
-            .active_tab_database()
-            .or_else(|| self.active_database().map(ToOwned::to_owned))
-            .unwrap_or_else(|| profile.initial_database().to_owned());
+        let database = match self.editor_execution_database(&profile) {
+            Ok(database) => database,
+            Err(error) => {
+                self.return_to_editor_after_execution = false;
+                self.status = format!("ERROR: {error}");
+                self.mode = AppMode::Editor;
+                return;
+            }
+        };
         let request_id = self.begin_request(format!("Ejecutando T-SQL en {database}..."));
         self.send(WorkerRequest::ExecuteSql {
             request_id,
@@ -4583,13 +4955,11 @@ impl App {
                 match result {
                     Ok(output) => {
                         let elapsed = output.elapsed_ms.max(elapsed_ms);
-                        self.console_success = Some(output.success);
                         let combined = output.combined();
                         let line_count = combined.lines().count();
-                        let sql_result = output.table.clone();
-                        self.content = combined;
-                        self.content_scroll = 0;
-                        self.sql_result = output.success.then_some(sql_result).flatten();
+                        let table = output.table.clone().filter(|_| output.success);
+                        let success = output.success;
+                        self.append_console_result(database.clone(), output, elapsed);
                         self.highlighted_content = None;
                         self.table_page = None;
                         self.table_metadata = None;
@@ -4598,24 +4968,13 @@ impl App {
                         self.sort_session = None;
                         self.column_search_session = None;
                         self.table_show_metadata = false;
-                        let status_icon = if output.success { "✓" } else { "✗" };
-                        if let Some(table) = self.sql_result.as_ref() {
-                            let result_count = table.rows.len();
-                            let column_count = table.columns.len();
-                            self.content_title = format!(
-                                "Resultados · {database} · {elapsed}ms · {result_count} filas · {column_count} cols {status_icon}"
-                            );
-                        } else {
-                            self.content_title = format!(
-                                "Consola · {database} · {elapsed}ms · {line_count} líneas {status_icon}"
-                            );
-                        }
-                        if output.success {
+                        let status_icon = if success { "✓" } else { "✗" };
+                        if success {
                             if let Some(session) = self.editor.as_mut() {
                                 session.editor.mark_clean();
                             }
                             self.persist_active_editor();
-                            self.status = if let Some(table) = self.sql_result.as_ref() {
+                            self.status = if let Some(table) = table.as_ref() {
                                 format!(
                                     "T-SQL OK · {elapsed}ms · {} filas · {} columnas · {status_icon}",
                                     table.rows.len(),
@@ -4631,11 +4990,17 @@ impl App {
                         }
                     }
                     Err(error) => {
-                        self.console_success = Some(false);
-                        self.sql_result = None;
-                        let line_count = error.lines().count();
-                        self.content = error.clone();
-                        self.content_scroll = 0;
+                        self.append_console_result(
+                            database.clone(),
+                            SqlOutput {
+                                stdout: error.clone(),
+                                stderr: String::new(),
+                                success: false,
+                                elapsed_ms,
+                                table: None,
+                            },
+                            elapsed_ms,
+                        );
                         self.highlighted_content = None;
                         self.table_page = None;
                         self.table_metadata = None;
@@ -4644,9 +5009,6 @@ impl App {
                         self.sort_session = None;
                         self.column_search_session = None;
                         self.table_show_metadata = false;
-                        self.content_title = format!(
-                            "Consola · {database} · {elapsed_ms}ms · {line_count} líneas ✗"
-                        );
                         self.status = format!("ERROR · {elapsed_ms}ms · {}", first_line(&error));
                     }
                 }
@@ -4809,6 +5171,79 @@ fn search_input(text: &str) -> TextArea<'static> {
     }
 
     text.lines().map(ToOwned::to_owned).collect()
+}
+
+fn console_result_title(result: &ConsoleResult) -> String {
+    let status_icon = if result.output.success { "✓" } else { "✗" };
+    if let Some(table) = result
+        .output
+        .table
+        .as_ref()
+        .filter(|_| result.output.success)
+    {
+        format!(
+            "Resultados · {} · {}ms · {} filas · {} cols {status_icon}",
+            result.database,
+            result.elapsed_ms,
+            table.rows.len(),
+            table.columns.len()
+        )
+    } else {
+        format!(
+            "Consola · {} · {}ms · {} líneas {status_icon}",
+            result.database,
+            result.elapsed_ms,
+            result.output.combined().lines().count()
+        )
+    }
+}
+
+fn console_result_text(result: &ConsoleResult) -> String {
+    if let Some(table) = result
+        .output
+        .table
+        .as_ref()
+        .filter(|_| result.output.success)
+    {
+        table_preview_text(table)
+    } else {
+        result.output.combined()
+    }
+}
+
+fn console_result_line(result: &ConsoleResult) -> String {
+    if let Some(table) = result
+        .output
+        .table
+        .as_ref()
+        .filter(|_| result.output.success)
+    {
+        if let Some(row) = table.rows.get(result.selected_row) {
+            return row.join("\t");
+        }
+        return table.columns.join("\t");
+    }
+
+    let lines = result.output.combined();
+    let lines = lines.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let index = if result.scroll == u16::MAX {
+        lines.len() - 1
+    } else {
+        (result.scroll as usize).min(lines.len() - 1)
+    };
+    lines[index].to_owned()
+}
+
+fn table_preview_text(table: &TablePreview) -> String {
+    let mut lines = Vec::with_capacity(table.rows.len() + 1);
+    if !table.columns.is_empty() {
+        lines.push(table.columns.join("\t"));
+    }
+    lines.extend(table.rows.iter().map(|row| row.join("\t")));
+    lines.join("\n")
 }
 
 fn shifted_index(current: usize, len: usize, delta: isize) -> usize {
@@ -5208,6 +5643,12 @@ fn table_execution_rolled_back(output: &SqlOutput) -> bool {
     output
         .combined()
         .contains(sybase::queries::staged_rolled_back_marker())
+}
+
+fn is_help_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('?') | KeyCode::Char('/'))
 }
 
 fn format_key(key: KeyEvent) -> String {
@@ -5890,18 +6331,18 @@ fn shift_row_indexes(rows: &BTreeSet<usize>, removed_row: usize) -> BTreeSet<usi
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppMode, EditorPurpose, EditorSession, TableCellDraft, TableCopySource,
-        TableDateTimeKind, TableDraftChange, compact_table_summary_value,
-        contains_executable_table_sql, format_parsed_table_date_time, format_table_type,
-        is_write_sql, normalize_definition_for_edit, parse_table_date_time_value,
-        reorder_table_page, selected_table_value, shift_row_indexes, shifted_index,
-        store_table_cell_draft, table_copy_rows_text, table_copy_text, table_date_time_kind,
-        table_draft_exit_message, table_execution_committed, table_execution_rolled_back,
-        table_exit_message, table_filter_suggestions, table_sort_suggestions,
-        validate_table_cell_value,
+        App, AppMode, ConsoleResult, EditorPurpose, EditorSession, TableCellDraft, TableCopySource,
+        TableDateTimeKind, TableDraftChange, compact_table_summary_value, console_result_line,
+        console_result_text, contains_executable_table_sql, format_parsed_table_date_time,
+        format_table_type, is_write_sql, normalize_definition_for_edit,
+        parse_table_date_time_value, reorder_table_page, selected_table_value, shift_row_indexes,
+        shifted_index, store_table_cell_draft, table_copy_rows_text, table_copy_text,
+        table_date_time_kind, table_draft_exit_message, table_execution_committed,
+        table_execution_rolled_back, table_exit_message, table_filter_suggestions,
+        table_sort_suggestions, validate_table_cell_value,
     };
     use crate::config::{AppConfig, ConnectionProfile};
-    use crate::db::models::{ColumnMetadata, SqlOutput, TablePage};
+    use crate::db::models::{ColumnMetadata, SqlOutput, TablePage, TablePreview};
     use crate::db::query::PageCursor;
     use crate::editor::VimEditor;
     use crate::tabs::TabsState;
@@ -5993,6 +6434,133 @@ mod tests {
         assert_eq!(app.mode, AppMode::Confirm);
         assert!(app.editor.is_some());
         assert!(app.confirm_message().contains("cambios sin ejecutar"));
+    }
+
+    #[test]
+    fn rejects_editor_execution_against_an_unavailable_database() {
+        let mut app = editor_test_app();
+        app.databases = vec!["meg_servicios".to_owned()];
+        app.tabs
+            .push_query("reporting".to_owned(), "select 1".to_owned());
+        let profile = app.current_profile().cloned().unwrap();
+
+        let error = app.editor_execution_database(&profile).unwrap_err();
+
+        assert!(error.contains("reporting"));
+        assert!(error.contains("Ctrl+D"));
+    }
+
+    #[test]
+    fn console_history_keeps_table_and_text_results() {
+        let table = TablePreview {
+            columns: vec!["id".to_owned(), "name".to_owned()],
+            rows: vec![vec!["1".to_owned(), "Alice".to_owned()]],
+        };
+        let table_result = ConsoleResult {
+            database: "meg_servicios".to_owned(),
+            output: SqlOutput {
+                stdout: "|id|name|".to_owned(),
+                stderr: String::new(),
+                success: true,
+                elapsed_ms: 12,
+                table: Some(table),
+            },
+            elapsed_ms: 12,
+            scroll: 0,
+            selected_row: 0,
+            selected_column: 0,
+        };
+        let text_result = ConsoleResult {
+            database: "meg_servicios".to_owned(),
+            output: SqlOutput {
+                stdout: "Msg 208\ncl_ente not found".to_owned(),
+                stderr: String::new(),
+                success: false,
+                elapsed_ms: 8,
+                table: None,
+            },
+            elapsed_ms: 8,
+            scroll: 1,
+            selected_row: 0,
+            selected_column: 0,
+        };
+
+        assert_eq!(console_result_line(&table_result), "1\tAlice");
+        assert_eq!(console_result_text(&table_result), "id\tname\n1\tAlice");
+        assert_eq!(console_result_line(&text_result), "cl_ente not found");
+        assert_eq!(
+            console_result_text(&text_result),
+            "Msg 208\ncl_ente not found"
+        );
+    }
+
+    #[test]
+    fn console_focus_can_be_toggled_and_cleared_without_switching_tabs() {
+        let mut app = editor_test_app();
+        app.mode = AppMode::Editor;
+        app.editor = Some(EditorSession {
+            title: "Consulta".to_owned(),
+            purpose: EditorPurpose::Query,
+            editor: VimEditor::new("select 1"),
+        });
+        app.append_console_result(
+            "meg_servicios".to_owned(),
+            SqlOutput {
+                stdout: "ok".to_owned(),
+                stderr: String::new(),
+                success: true,
+                elapsed_ms: 1,
+                table: None,
+            },
+            1,
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(app.console_is_focused());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(app.console_results().is_empty());
+        assert!(app.console_is_focused());
+    }
+
+    #[test]
+    fn ctrl_question_mark_opens_scrollable_help_and_returns_to_previous_mode() {
+        let mut app = editor_test_app();
+        app.mode = AppMode::Editor;
+        app.editor = Some(EditorSession {
+            title: "Consulta".to_owned(),
+            purpose: EditorPurpose::Query,
+            editor: VimEditor::new("select 1"),
+        });
+        app.help_scroll = 12;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.mode, AppMode::Help);
+        assert_eq!(app.help_scroll, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, 1);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, u16::MAX);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, AppMode::Editor);
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn ctrl_shift_slash_opens_help_from_the_browser() {
+        let mut app = editor_test_app();
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(app.mode, AppMode::Help);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.mode, AppMode::Browser);
     }
 
     #[test]

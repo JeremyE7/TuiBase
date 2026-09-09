@@ -5,16 +5,16 @@ use ratatui::{
     symbols::scrollbar::Set,
     text::{Line, Span, Text},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Table, Tabs, Wrap,
+        Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, Table, Tabs, Wrap,
     },
 };
 
 pub mod syntax;
 
 use crate::{
-    app::{App, AppMode, Focus, TableCopyStage},
-    db::models::ObjectKind,
+    app::{App, AppMode, ConsoleResult, Focus, TableCopyStage},
+    db::models::{ObjectKind, TablePreview},
     editor::{SelectionRange, VimMode},
 };
 
@@ -85,7 +85,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     match app.mode {
         AppMode::Confirm => render_confirmation(frame, app),
-        AppMode::Help => render_help(frame),
+        AppMode::Help => render_help(frame, app),
         AppMode::Search => render_search_overlay(frame, app),
         _ => {}
     }
@@ -126,7 +126,7 @@ fn render_tabs_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(tabs, rows[0]);
 
     let help = Paragraph::new(
-        " : SQL libre · Ctrl+Tab siguiente · Ctrl+w cerrar tab · q navegador · Ctrl+Enter selección",
+        " : SQL libre · Ctrl+Tab siguiente · Ctrl+w cerrar tab · q navegador · Ctrl+J resultados",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(
@@ -1225,56 +1225,176 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
     }
 
-    if app.sql_result.is_some() {
-        render_sql_result(frame, editor_layout[1], app);
-    } else {
+    if app.console_results().is_empty() {
         let console = console_text(app);
         let result = Paragraph::new(console)
             .block(panel_block(format!(" {} ", app.content_title), false))
             .wrap(Wrap { trim: false })
             .scroll((app.content_scroll, 0));
         frame.render_widget(result, editor_layout[1]);
+    } else {
+        render_console_results(frame, editor_layout[1], app);
     }
 
     render_status(frame, vertical[1], app);
 }
 
-fn render_sql_result(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(result) = app.sql_result.as_ref() else {
+fn render_console_results(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(result) = app.active_console_result() else {
         return;
     };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+    let titles = app
+        .console_results()
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let label = if let Some(table) = result
+                .output
+                .table
+                .as_ref()
+                .filter(|_| result.output.success)
+            {
+                format!(
+                    "{}: tabla {}x{}",
+                    index + 1,
+                    table.rows.len(),
+                    table.columns.len()
+                )
+            } else {
+                format!("{}: consola", index + 1)
+            };
+            Line::from(label)
+        })
+        .collect::<Vec<_>>();
+    let tab_help = if app.console_is_focused() {
+        "Ctrl+J editor · Ctrl+PgUp/PgDn resultado · y línea · Y todo · Ctrl+L limpiar"
+    } else {
+        "Ctrl+J enfocar consola · Ctrl+PgUp/PgDn cambiar resultado"
+    };
+    let tabs = Tabs::new(titles)
+        .select(app.console_result_index())
+        .style(Style::default().fg(Color::Gray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider(Span::raw(" │ "))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .title(tab_help)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+    frame.render_widget(tabs, rows[0]);
+
+    if let Some(table) = result
+        .output
+        .table
+        .as_ref()
+        .filter(|_| result.output.success)
+    {
+        render_console_table(frame, rows[1], app, result, table);
+    } else {
+        let text = console_text(app);
+        let block = panel_block(format!(" {} ", app.content_title), app.console_is_focused());
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((result.scroll, 0));
+        frame.render_widget(paragraph, rows[1]);
+    }
+}
+
+fn render_console_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    result: &ConsoleResult,
+    table_result: &TablePreview,
+) {
     let available_width = area.width.saturating_sub(2) as usize;
     let visible_columns = ((available_width + TABLE_COLUMN_SPACING)
         / (TABLE_COLUMN_WIDTH + TABLE_COLUMN_SPACING))
         .max(1)
-        .min(result.columns.len());
-    let column_range = 0..visible_columns;
-    let hidden_columns = result.columns.len().saturating_sub(visible_columns);
+        .min(table_result.columns.len());
+    if visible_columns == 0 {
+        frame.render_widget(
+            Paragraph::new("Resultado tabular sin columnas")
+                .block(panel_block(" Resultados ", app.console_is_focused())),
+            area,
+        );
+        return;
+    }
+    let max_column_start = table_result.columns.len().saturating_sub(visible_columns);
+    let column_start = result
+        .selected_column
+        .saturating_sub(visible_columns.saturating_sub(1))
+        .min(max_column_start);
+    let column_range = column_start..column_start + visible_columns;
+    let hidden_columns = table_result.columns.len().saturating_sub(visible_columns);
     let column_summary = if hidden_columns == 0 {
         String::new()
     } else {
         format!(
-            " · mostrando {visible_columns}/{} cols",
-            result.columns.len()
+            " · cols {}-{} de {}",
+            column_start + 1,
+            column_start + visible_columns,
+            table_result.columns.len(),
         )
     };
-    let block = panel_block(format!(" {}{} ", app.content_title, column_summary), false);
+    let block = panel_block(
+        format!(" {}{} ", app.content_title, column_summary),
+        app.console_is_focused(),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let selected_style = Style::default()
+        .bg(Color::DarkGray)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let selected_cell_style = Style::default()
+        .bg(Color::LightYellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
     let header = Row::new(
         column_range
             .clone()
-            .map(|index| result.columns[index].clone()),
+            .map(|index| table_result.columns[index].clone()),
     )
     .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows = result.rows.iter().map(|values| {
-        Row::new(
-            column_range
-                .clone()
-                .map(|index| values.get(index).cloned().unwrap_or_default()),
-        )
-    });
+    let visible_rows = inner.height.saturating_sub(1).max(1) as usize;
+    let row_start = result
+        .selected_row
+        .min(table_result.rows.len().saturating_sub(1))
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(table_result.rows.len().saturating_sub(visible_rows));
+    let rows = table_result
+        .rows
+        .iter()
+        .enumerate()
+        .skip(row_start)
+        .take(visible_rows)
+        .map(|(row_index, values)| {
+            let row = Row::new(column_range.clone().map(|index| {
+                let cell = Cell::from(values.get(index).cloned().unwrap_or_default());
+                if row_index == result.selected_row && index == result.selected_column {
+                    cell.style(selected_cell_style)
+                } else {
+                    cell
+                }
+            }));
+            if row_index == result.selected_row {
+                row.style(selected_style)
+            } else {
+                row
+            }
+        });
     let table = Table::new(
         rows,
         vec![Constraint::Length(TABLE_COLUMN_WIDTH as u16); visible_columns],
@@ -1613,56 +1733,155 @@ fn render_execution_error_modal(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(message, area);
 }
 
-fn render_help(frame: &mut Frame<'_>) {
-    let area = centered_rect(84, 82, frame.area());
+fn render_help(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(92, 92, frame.area());
     frame.render_widget(Clear, area);
     let help = [
-        "NAVEGADOR",
-        "  h/l o Tab     cambiar panel      j/k        mover selección",
-        "  Enter         abrir/cargar        r          recargar panel",
-        "  R             recargar conexiones c          probar conexión",
-        "  Enter         tabla/detalle       e          editar SP/función/vista",
-        "  E             editar datos T-SQL  :          consulta T-SQL",
-        "\nTABLA",
-        "  Enter         ver valor completo de la celda",
-        "  e             editar celda/picker y guardar borrador local",
-        "  i             metadata de columnas e índices",
-        "  y             copiar celda/metadata       Y menú de copia",
-        "  v             selección visual            Esc cancela",
-        "  Shift+V       selección visual de filas",
-        "  d             marcar fila/rango para borrar",
-        "  dd            copiar y marcar fila        u deshacer/descartar",
-        "  +             fila nueva                 Shift+= clonar fila",
-        "  j/k           desplazarse                h/l mover columna",
-        "  c             buscar columna             p fijar/desfijar",
-        "  f             filtro con autocompletado  F limpiar filtro",
-        "  o             ordenar columnas           O limpiar orden",
-        "  r             recargar datos (respeta orden/filtro)",
-        "  Ctrl+S        resumen de cambios staged",
-        "  /             búsqueda global             ? ayuda · q salir",
+        "GUÍA COMPLETA DE TECLADO",
         "",
-        "EDITOR NVIM-LIKE",
-        "  i/a/A/I       insertar            Esc        volver a NORMAL",
-        "  q             volver al navegador  Ctrl+w     cerrar tab",
-        "  h/j/k/l       mover               w/b        palabra siguiente/anterior",
-        "  0/$           inicio/fin línea    gg/G       inicio/fin archivo",
-        "  o/O           línea debajo/arriba x          borrar carácter",
-        "  dd/yy/p       cortar/copiar/pegar  u/Ctrl+r   deshacer/rehacer",
-        "  v             selección visual    Ctrl+S     ejecutar/guardar",
-        "  PgUp/PgDn/Home/End  desplazar consola  Ctrl+y copiar · Ctrl+Shift+L limpiar",
-        "  Ctrl+Space/Ctrl+n   completar         K (Normal) hover info",
+        "AYUDA",
+        "  Ctrl+? / Ctrl+Shift+/  abrir esta guía desde cualquier modo",
+        "  Esc / ? / q             cerrar la guía",
+        "  j/k o ↑/↓               desplazar una línea",
+        "  PgUp/PgDn               desplazar una página",
+        "  Home/End o g/G          ir al inicio/final",
+        "",
+        "ATAJOS GLOBALES Y TABS",
+        "  Ctrl+b                  mostrar/ocultar sidebar",
+        "  Shift+H / Shift+L       tab anterior/siguiente",
+        "  Ctrl+Tab                tab siguiente",
+        "  Ctrl+Shift+Tab          tab anterior",
+        "  Ctrl+h / Ctrl+l         tab anterior/siguiente",
+        "  Ctrl+Backspace          tab anterior",
+        "  Ctrl+w                  cerrar tab activa",
+        "",
+        "NAVEGADOR",
+        "  h/l, ←/→ o Tab          cambiar panel; activa con l/→",
+        "  Shift+Tab / BackTab     panel anterior",
+        "  j/k, ↑/↓                mover selección",
+        "  g/G o Home/End          primera/última selección",
+        "  Enter                  cargar conexión, objetos o tabla",
+        "  1/2/3/4                enfocar conexiones/bases/tipos/objetos",
+        "  r                      recargar panel actual",
+        "  R                      recargar connections.toml",
+        "  c                      probar conexión",
+        "  e                      editar procedimiento, función o vista",
+        "  E                      abrir editor transaccional de datos",
+        "  :                      abrir consulta SQL libre",
+        "  /                      búsqueda global",
+        "  F5                     actualizar catálogo",
+        "  y                      copiar contenido visible",
+        "  ?                      abrir ayuda; q salir; Ctrl+c salir inmediatamente",
+        "",
+        "TABLA — VISTA PRINCIPAL",
+        "  j/k o ↑/↓              cambiar fila; h/l o ←/→ cambiar columna",
+        "  g/G o Home/End         ir a primera/última fila",
+        "  Enter                  ver el valor completo de la celda",
+        "  e                      editar celda o abrir picker date/time",
+        "  i                      mostrar/ocultar metadata",
+        "  c                      buscar y enfocar una columna",
+        "  p                      fijar/desfijar columna",
+        "  f / F                  abrir / limpiar filtro",
+        "  o / O                  abrir / limpiar ordenamiento",
+        "  r                      recargar datos respetando filtro/orden",
+        "  v / V / Shift+V        selección de celdas / filas",
+        "  y / Y                  copiar celda/selección / abrir menú de copia",
+        "  d / dd                 marcar fila/rango / copiar y marcar fila",
+        "  u                      deshacer borrador de fila o borrado marcado",
+        "  +                      agregar fila nueva",
+        "  Shift+=                clonar fila seleccionada",
+        "  Ctrl+s                 abrir resumen de cambios staged",
+        "  /                      búsqueda global; ? ayuda; q/Esc salir",
+        "",
+        "TABLA — SUBMENÚS Y MODALES",
+        "  Filtro/orden/columna   escribir; Tab completa; ↑/↓ elige; Enter aplica",
+        "  Filtro/orden/columna   Ctrl+l limpia entrada; Esc cancela",
+        "  Menú de copia          j/k elige; Enter continúa; Esc cancela",
+        "  Cabecera de copia      y incluye cabecera; n/Enter la omite",
+        "  Valor completo          j/k/PgUp/PgDn desplaza; Enter/Esc cierra",
+        "  Metadata                j/k/PgUp/PgDn desplaza; g/G inicio/final",
+        "  Editor de celda         escribir; Enter/Ctrl+s guarda borrador; Esc cancela",
+        "  Picker date/time         Tab/→ siguiente; Shift+Tab/← anterior",
+        "  Picker date/time         ↑/↓ ajusta; Space alterna NULL; Enter guarda",
+        "  Resumen de cambios       Enter abre SQL; j/k/PgUp/PgDn desplaza; Esc cierra",
+        "  Vista previa SQL         Ctrl+s solicita ejecución; Esc vuelve; j/k desplaza",
+        "  Error de ejecución       Enter/Esc cierra; j/k/PgUp/PgDn desplaza",
+        "  Confirmación              y confirma; n/Esc/Enter cancela",
+        "",
+        "EDITOR SQL LIBRE — CONTROLES DE LA APLICACIÓN",
+        "  Ctrl+s                  ejecutar consulta o guardar DDL",
+        "  Ctrl+Enter              ejecutar solo la selección visual",
+        "  Ctrl+d                  asociar consulta a la base seleccionada",
+        "  Ctrl+j                  enfocar consola / volver al editor",
+        "  Ctrl+Space / Ctrl+n     abrir autocompletado",
+        "  K (NORMAL)              mostrar información bajo el cursor",
+        "  Ctrl+a                  seleccionar todo el buffer",
+        "  Ctrl+v                  pegar en INSERT; alternar visual por bloques",
+        "  Ctrl+c (VISUAL)         copiar selección",
+        "",
+        "EDITOR — NORMAL",
+        "  Esc                     cancelar operación pendiente",
+        "  q                       volver al navegador; Ctrl+w cierra la tab",
+        "  i/a/A/I                 insertar en cursor / después / final / primer texto",
+        "  o/O                     crear línea debajo / arriba",
+        "  h/j/k/l o flechas       mover cursor",
+        "  w/W, b/B, e/E           palabra siguiente / anterior / final",
+        "  0/^/$ o Home/End        inicio / primer no-espacio / final de línea",
+        "  gg/G                    inicio / final del archivo; nG salta a la línea n",
+        "  PgUp/PgDn               desplazamiento vertical",
+        "  x/Delete, X             borrar carácter siguiente / anterior",
+        "  d/c/y + movimiento      borrar / cambiar / copiar un rango",
+        "  dd/cc/yy                operar sobre líneas completas",
+        "  Y                       copiar líneas completas",
+        "  p/P                     pegar después / antes; usa clipboard como fallback",
+        "  u / Ctrl+r              deshacer / rehacer",
+        "  v / V / Ctrl+v          visual carácter / línea / bloque",
+        "  J                       unir línea con la siguiente",
+        "  1..9 (y combinaciones)  prefijo de cantidad para movimientos/operaciones",
+        "",
+        "EDITOR — INSERT Y VISUAL",
+        "  INSERT: Esc             volver a NORMAL",
+        "  INSERT: Ctrl+w          borrar palabra anterior",
+        "  INSERT: Ctrl+u          borrar hasta el inicio de línea",
+        "  INSERT: Ctrl+l          insertar una línea al final",
+        "  VISUAL: movimiento      ampliar selección con h/j/k/l, w/b/e, 0/^/$",
+        "  VISUAL: v/V             alternar carácter/línea; Ctrl+v alterna bloque",
+        "  VISUAL: y               copiar y salir; d/x borrar; c cambiar e insertar",
+        "  VISUAL: I/A (bloque)    insertar al inicio/final de cada línea",
+        "  VISUAL: Esc             cancelar selección; q vuelve al navegador",
+        "",
+        "CONSOLA DE RESULTADOS SQL",
+        "  Ctrl+J                  enfocar consola; Esc/Ctrl+J volver al editor",
+        "  Ctrl+PgUp/PgDn          cambiar entre resultados",
+        "  j/k, ↑/↓               navegar filas o texto",
+        "  h/l, ←/→               navegar columnas en tablas",
+        "  PgUp/PgDn              desplazar texto o filas",
+        "  g/Home, G/End          inicio/final del resultado",
+        "  y                       copiar línea/fila seleccionada",
+        "  Y                       copiar todo el resultado",
+        "  Ctrl+l                 limpiar resultado actual",
+        "  Ctrl+Shift+l           limpiar todos los resultados",
+        "",
+        "BÚSQUEDA Y AUTOCOMPLETADO",
+        "  /                      abrir búsqueda global desde navegador/tabla",
+        "  ↑/↓                    elegir sugerencia",
+        "  Tab                    aceptar sugerencia",
+        "  Enter                  navegar al elemento seleccionado",
+        "  Ctrl+l                 limpiar la búsqueda o entrada activa",
+        "  Esc                    cancelar búsqueda/autocompletado",
         "",
         "SEGURIDAD",
-        "  RO bloquea DDL/DML. En RW, toda escritura requiere confirmación.",
-        "  Las credenciales pueden leerse de aseuserstore mediante userstore_key.",
+        "  RO bloquea DDL/DML; RW solicita confirmación antes de escribir",
+        "  Ctrl+? abre esta guía sin alterar la consulta ni el estado activo",
         "",
-        "Pulsa Esc, ? o q para cerrar esta ayuda.",
+        "Usa j/k, ↑/↓, PgUp/PgDn o Home/End para recorrer esta guía.",
     ]
     .join("\n");
     frame.render_widget(
         Paragraph::new(help)
-            .block(panel_block(" Ayuda ", true))
-            .wrap(Wrap { trim: false }),
+            .block(panel_block(" Ayuda de teclado · Ctrl+? ", true))
+            .wrap(Wrap { trim: false })
+            .scroll((app.help_scroll, 0)),
         area,
     );
 }

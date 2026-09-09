@@ -116,49 +116,142 @@ cargo build --release
 
 ## Controles
 
+La guía completa está disponible dentro de la aplicación con `Ctrl+?` (en algunos terminales se recibe como `Ctrl+Shift+/`). También se puede abrir con `?` desde el navegador y la tabla.
+
+### Ayuda, tabs y atajos globales
+
+| Tecla | Acción |
+|---|---|
+| `Ctrl+?` / `Ctrl+Shift+/` | Abrir esta guía desde cualquier modo |
+| `Esc` / `?` / `q` en la guía | Cerrar la guía |
+| `j` / `k`, `↑` / `↓` | Desplazar la guía |
+| `PgUp` / `PgDn`, `Home` / `End` | Desplazar por página o ir al inicio/final |
+| `Ctrl+b` | Mostrar/ocultar sidebar |
+| `Shift+H` / `Shift+L` | Cambiar a tab anterior/siguiente |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Cambiar a tab siguiente/anterior |
+| `Ctrl+h` / `Ctrl+l` | Cambiar a tab anterior/siguiente |
+| `Ctrl+Backspace` | Cambiar a tab anterior |
+| `Ctrl+w` | Cerrar tab activa |
+
 ### Navegador
 
 | Tecla | Acción |
 |---|---|
-| `h` / `l`, `Tab` / `Shift+Tab` | Cambiar panel |
-| `Shift+H` / `Shift+L`, `Ctrl+Tab` / `Ctrl+Shift+Tab` | Cambiar tab |
-| `j` / `k` | Mover selección o scroll del contenido |
-| `g` / `G` | Inicio / final |
-| `Enter` | Activar conexión, cargar objetos o abrir definición |
-| `c` | Probar conexión |
+| `h` / `l`, `←` / `→`, `Tab` / `Shift+Tab` | Cambiar panel |
+| `j` / `k`, `↑` / `↓` | Mover selección |
+| `g` / `G`, `Home` / `End` | Primera/última selección |
+| `Enter` | Activar conexión, cargar objetos o abrir tabla |
+| `1` / `2` / `3` / `4` | Enfocar conexiones/bases/tipos/objetos |
 | `r` | Recargar el panel actual |
 | `R` | Volver a leer `connections.toml` |
-| `p` | Previsualizar hasta 100 filas de una tabla |
+| `c` | Probar conexión |
 | `e` | Editar procedimiento, función o vista |
-| `E` | Abrir plantilla transaccional para editar datos |
+| `E` | Abrir editor transaccional de datos |
 | `:` | Abrir editor de consulta T-SQL |
-| `?` | Ayuda |
-| `q` | Salir |
+| `/` | Abrir búsqueda global |
+| `F5` | Actualizar catálogo |
+| `y` | Copiar contenido visible |
+| `?` | Abrir ayuda |
+| `q` | Salir de la aplicación |
+| `Ctrl+c` | Salir inmediatamente |
 
-### Editor
+### Tabla
 
 | Tecla | Acción |
 |---|---|
+| `j` / `k`, `↑` / `↓` | Cambiar fila |
+| `h` / `l`, `←` / `→` | Cambiar columna |
+| `g` / `G`, `Home` / `End` | Primera/última fila |
+| `Enter` | Ver el valor completo de la celda |
+| `e` | Editar celda o abrir picker date/time |
+| `i` | Mostrar/ocultar metadata |
+| `c` | Buscar y enfocar una columna |
+| `p` | Fijar/desfijar columna |
+| `f` / `F` | Abrir/limpiar filtro |
+| `o` / `O` | Abrir/limpiar ordenamiento |
+| `r` | Recargar datos respetando filtro y orden |
+| `v` / `V` / `Shift+V` | Selección de celdas/filas |
+| `y` / `Y` | Copiar celda/selección o abrir menú de copia |
+| `d` / `dd` | Marcar fila/rango o copiar y marcar fila |
+| `u` | Deshacer borrador de fila o borrado marcado |
+| `+` | Agregar fila nueva |
+| `Shift+=` | Clonar la fila seleccionada |
+| `Ctrl+s` | Abrir resumen de cambios staged |
+| `/` | Búsqueda global |
+| `?` | Ayuda |
+| `q` / `Esc` | Salir; `Esc` también cancela el modo activo |
+
+En los filtros, ordenamientos y búsqueda de columnas: escribir modifica la entrada, `Tab` completa, `↑/↓` cambia la sugerencia, `Enter` aplica o salta, `Ctrl+l` limpia y `Esc` cancela. En el menú de copia, `j/k` elige, `Enter` continúa y `y/n` decide si incluye cabecera.
+
+Los modales de valor, metadata, resumen, vista previa y error usan `j/k`, `PgUp/PgDn`, `g/G` o `Home/End` para desplazarse y `Enter`/`Esc` para cerrar cuando corresponde. El picker date/time usa `Tab`/`Shift+Tab` o flechas para cambiar componente, `↑/↓` para ajustar, `Space` para alternar `NULL` y `Enter` para guardar. Las confirmaciones usan `y` para confirmar y `n`/`Enter`/`Esc` para cancelar.
+
+### Editor SQL libre
+
+| Tecla | Acción |
+|---|---|
+| `Ctrl+s` | Ejecutar consulta o guardar DDL |
+| `Ctrl+Enter` | Ejecutar solo la selección visual |
+| `Ctrl+d` | Asociar la consulta a la base seleccionada |
+| `Ctrl+j` | Enfocar/volver de la consola de resultados |
+| `Ctrl+Space` / `Ctrl+n` | Abrir autocompletado |
+| `K` en NORMAL | Mostrar información bajo el cursor |
+| `Ctrl+a` | Seleccionar todo el buffer |
+| `Ctrl+v` | Pegar en INSERT o alternar visual por bloques |
+| `Ctrl+c` en VISUAL | Copiar selección |
 | `i`, `a`, `A`, `I` | Entrar a INSERT |
 | `Esc` | Volver a NORMAL sin cerrar |
 | `q` | Volver al navegador desde NORMAL |
-| `h`, `j`, `k`, `l` | Mover cursor |
-| `w`, `b` | Palabra siguiente / anterior |
-| `e` | Final de la palabra |
-| `0`, `$` | Inicio / final de línea |
-| `gg`, `G` | Inicio / final del archivo |
-| `o`, `O` | Crear línea debajo / arriba |
-| `x`, `X` | Borrar carácter siguiente / anterior |
-| `d`, `c`, `y` + movimiento | Borrar, cambiar o copiar un rango |
-| `dd`, `cc`, `yy`, `p`, `P` | Operar sobre líneas y pegar después / antes; `p/P` usa portapapeles si no hay registro |
-| `v`, `V`, `Ctrl+V` | Selección visual carácter / línea / bloque |
-| `y`, `d`, `c`, `Ctrl+C` en selección visual | Copiar, borrar o cambiar la selección |
-| `Ctrl+A` | Seleccionar todo el buffer |
-| `Ctrl+V` en INSERT | Pegar desde el portapapeles del sistema |
-| `u`, `Ctrl+r` | Deshacer / rehacer |
-| `Ctrl+l` | Insertar línea al final y entrar a INSERT |
-| `Ctrl+Enter` | Ejecutar solo la selección VISUAL |
-| `Ctrl+s` | Ejecutar consulta o guardar DDL |
+| `h`, `j`, `k`, `l`, flechas | Mover cursor |
+| `w` / `W`, `b` / `B`, `e` / `E` | Mover por palabras |
+| `0` / `^` / `$`, `Home` / `End` | Inicio/final de línea |
+| `gg` / `G`, `nG` | Inicio/final del archivo o saltar a línea `n` |
+| `PgUp` / `PgDn` | Desplazamiento vertical |
+| `o` / `O` | Crear línea debajo/arriba |
+| `x` / `Delete`, `X` | Borrar carácter siguiente/anterior |
+| `d` / `c` / `y` + movimiento | Borrar/cambiar/copiar rango |
+| `dd` / `cc` / `yy` | Operar sobre líneas completas |
+| `Y` | Copiar líneas completas |
+| `p` / `P` | Pegar después/antes; usa clipboard como fallback |
+| `u` / `Ctrl+r` | Deshacer/rehacer |
+| `v` / `V` / `Ctrl+v` | Visual carácter/línea/bloque |
+| `J` | Unir línea con la siguiente |
+| `Ctrl+l` en INSERT | Insertar una línea al final |
+| `Ctrl+w` en INSERT | Borrar palabra anterior |
+| `Ctrl+u` en INSERT | Borrar hasta el inicio de línea |
+| `Esc` en VISUAL | Cancelar selección |
+| `y` en VISUAL | Copiar y salir |
+| `d` / `x` en VISUAL | Borrar y salir |
+| `c` en VISUAL | Cambiar selección e insertar |
+| `I` / `A` en VISUAL por bloques | Insertar al inicio/final de cada línea |
+| `1..9` | Prefijo de cantidad para movimientos/operaciones |
+
+### Consola de resultados SQL
+
+| Tecla | Acción |
+|---|---|
+| `Ctrl+j` | Enfocar consola o volver al editor |
+| `Esc` | Volver al editor |
+| `Ctrl+PgUp/PgDn` | Cambiar entre resultados |
+| `j` / `k`, `↑` / `↓` | Navegar filas o texto |
+| `h` / `l`, `←` / `→` | Navegar columnas en tablas |
+| `PgUp/PgDn` | Desplazar texto o filas |
+| `g` / `Home`, `G` / `End` | Inicio/final del resultado |
+| `y` | Copiar línea/fila seleccionada |
+| `Y` | Copiar todo el resultado |
+| `Ctrl+l` | Limpiar resultado actual |
+| `Ctrl+Shift+l` | Limpiar todos los resultados |
+
+### Búsqueda y autocompletado
+
+| Tecla | Acción |
+|---|---|
+| `/` | Abrir búsqueda global desde navegador/tabla |
+| `Ctrl+Space` / `Ctrl+n` | Abrir autocompletado en el editor |
+| `↑` / `↓` | Elegir sugerencia |
+| `Tab` | Aceptar sugerencia |
+| `Enter` | Navegar al elemento seleccionado |
+| `Ctrl+l` | Limpiar la entrada activa |
+| `Esc` | Cancelar búsqueda/autocompletado |
 
 El encabezado del editor muestra el modo activo como `NORMAL` o `INSERT`.
 

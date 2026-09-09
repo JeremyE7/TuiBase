@@ -33,7 +33,6 @@ impl IsqlBackend {
             .env_remove("LC_CTYPE");
         command
             .arg("-n")
-            .arg("-b")
             .arg("-w")
             .arg("65535")
             .arg("-s")
@@ -754,6 +753,16 @@ mod tests {
 
         assert_eq!(result.columns, ["name"]);
         assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn parses_actual_isql_output_with_pipe_borders() {
+        let output = "|base_actual|\n|-----------|\n|master|\n\n(1 row affected)\n";
+
+        let result = parse_sql_result(output).expect("actual isql table output");
+
+        assert_eq!(result.columns, ["base_actual"]);
+        assert_eq!(result.rows, vec![vec!["master".to_owned()]]);
     }
 
     #[test]
